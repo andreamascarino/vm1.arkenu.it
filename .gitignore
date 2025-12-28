@@ -1,0 +1,22 @@
+# File sensibili
+.auth_hash
+config.php
+
+# File di backup
+*.bak
+
+# File di stato/cache
+system-status.json
+stats.json
+
+# File di errore
+&1
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code settings
+.claude/
