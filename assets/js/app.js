@@ -26,21 +26,39 @@ function loadServices() {
 }
 
 function loadDisk() {
-    fetch('?action=disk').then(r => r.json()).then(d => {
-        // Server locale
-        const sUsed = (d.server.used / 1000000000).toFixed(1);
-        const sTotal = (d.server.total / 1000000000).toFixed(1);
-        const sPct = (d.server.used / d.server.total * 100).toFixed(1);
-        // QNAP backup
-        const qUsed = (d.qnap.used / 1000000000).toFixed(1);
-        const qLimit = (d.qnap.limit / 1000000000).toFixed(0);
-        const qPct = (d.qnap.used / d.qnap.limit * 100).toFixed(1);
-        document.getElementById('disk-info').innerHTML = `
-            <div class="disk-info"><span>Server</span><span>${sUsed} / ${sTotal} GB (${sPct}%)</span></div>
-            <div class="disk-bar"><div class="disk-fill" style="width:${sPct}%"></div></div>
-            <div class="disk-info" style="margin-top:0.5rem"><span>QNAP Backup</span><span>${qUsed} / ${qLimit} GB (${qPct}%)</span></div>
-            <div class="disk-bar"><div class="disk-fill" style="width:${qPct}%;background:var(--accent-secondary)"></div></div>`;
-    });
+function loadDisk() {
+    fetch('?action=disk')
+        .then(r => r.json())
+        .then(d => {
+            // Server locale
+            const sUsed = (d.server.used / 1000000000).toFixed(1);
+            const sTotal = (d.server.total / 1000000000).toFixed(1);
+            const sPct = (d.server.used / d.server.total * 100).toFixed(1);
+            
+            let html = `
+                <div class="disk-info"><span>Server</span><span>${sUsed} / ${sTotal} GB (${sPct}%)</span></div>
+                <div class="disk-bar"><div class="disk-fill" style="width:${sPct}%"></div></div>`;
+            
+            // QNAP backup - con gestione errori
+            if (d.qnap && d.qnap.used !== undefined && d.qnap.limit) {
+                const qUsed = (d.qnap.used / 1000000000).toFixed(1);
+                const qLimit = (d.qnap.limit / 1000000000).toFixed(0);
+                const qPct = (d.qnap.used / d.qnap.limit * 100).toFixed(1);
+                html += `
+                    <div class="disk-info" style="margin-top:0.5rem"><span>QNAP Backup</span><span>${qUsed} / ${qLimit} GB (${qPct}%)</span></div>
+                    <div class="disk-bar"><div class="disk-fill" style="width:${qPct}%;background:var(--accent-secondary)"></div></div>`;
+            } else {
+                html += `
+                    <div class="disk-info" style="margin-top:0.5rem;color:var(--warning)"><span>⚠️ QNAP Backup</span><span>Non raggiungibile</span></div>`;
+            }
+            
+            document.getElementById('disk-info').innerHTML = html;
+        })
+        .catch(err => {
+            console.error('Errore caricamento disk:', err);
+            document.getElementById('disk-info').innerHTML = `
+                <div class="disk-info" style="color:var(--danger)"><span>⚠️ Errore</span><span>Impossibile caricare dati disco</span></div>`;
+        });
 }
 
 function loadPhpVersions() {

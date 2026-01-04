@@ -272,13 +272,17 @@ if (isAuthenticated() && isset($_GET['action'])) {
                 'free' => disk_free_space('/'),
                 'used' => disk_total_space('/') - disk_free_space('/')
             ];
-            // Spazio QNAP backup
-            $qnapOutput = shell_exec("rclone size 'qnap:/share/FTP/processwire/' --json 2>/dev/null");
+            // Spazio QNAP backup - con timeout e gestione errori
+            $qnapOutput = shell_exec("timeout 5 rclone size 'qnap:/share/FTP/processwire/' --json 2>/dev/null");
             $qnapData = json_decode($qnapOutput, true);
-            $qnap = [
-                'used' => $qnapData['bytes'] ?? 0,
-                'limit' => 500 * 1000000000 // 500GB
-            ];
+            $qnap = null;
+            // Solo se abbiamo dati validi (non null e con bytes)
+            if ($qnapData && isset($qnapData['bytes'])) {
+                $qnap = [
+                    'used' => $qnapData['bytes'],
+                    'limit' => 500 * 1000000000 // 500GB
+                ];
+            }
             echo json_encode(['server' => $server, 'qnap' => $qnap]);
             exit;
 
