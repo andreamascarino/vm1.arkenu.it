@@ -84,9 +84,9 @@ function safeRcloneCommand($command, $timeout = 5) {
     return ['error' => false, 'output' => $trimmed];
 }
 
-function getLastBackup($domain) {
-    // Verifica disponibilità QNAP prima di procedere
-    if (!isQnapAvailable(3)) {
+function getLastBackup($domain, $skipCheck = false) {
+    // Verifica disponibilità QNAP prima di procedere (skipCheck=true se già verificato)
+    if (!$skipCheck && !isQnapAvailable(3)) {
         return 'Server di backup non disponibile';
     }
     
@@ -244,6 +244,9 @@ if (isAuthenticated() && isset($_GET['action'])) {
             $backupEnabled = getBackupEnabled();
             $phpVersions = getAvailablePhpVersions();
             
+            // Verifica disponibilità QNAP UNA SOLA VOLTA prima del loop per ottimizzare performance
+            $qnapAvailable = isQnapAvailable(3);
+            
             foreach (glob(SITES_DIR . '/*/') as $dir) {
                 $domain = basename($dir);
                 if ($domain === 'vm1.arkenu.it') continue;
@@ -256,13 +259,23 @@ if (isAuthenticated() && isset($_GET['action'])) {
                 $totalMb = toMb($details['sizeFiles']) + toMb($details['sizeDb']);
                 $totalSize = formatSize($totalMb);
                 
+                // Se QNAP non è disponibile, usa messaggio diretto senza chiamare getLastBackup
+                $lastBackup = 'Disattivo';
+                if ($backupOn) {
+                    if ($qnapAvailable) {
+                        $lastBackup = getLastBackup($domain, true) ?: 'Mai'; // skipCheck=true perché già verificato
+                    } else {
+                        $lastBackup = 'Server di backup non disponibile';
+                    }
+                }
+                
                 $sites[] = [
                     'domain' => $domain,
                     'size' => $totalSize,
                     'sizeFiles' => $details['sizeFiles'],
                     'sizeDb' => $details['sizeDb'],
                     'ssl' => $hasSSL,
-                    'lastBackup' => $backupOn ? (getLastBackup($domain) ?: 'Mai') : 'Disattivo',
+                    'lastBackup' => $lastBackup,
                     'phpVersion' => $phpVersion,
                     'phpVersions' => $phpVersions,
                     'dbName' => $details['dbName'],
