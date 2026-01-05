@@ -37,38 +37,110 @@ function parseBackupDate($filename) {
     return null;
 }
 
+function isQnapAvailable($timeout = 3) {
+    // Verifica rapida se il QNAP è raggiungibile usando solo shell_exec (exec potrebbe essere disabilitato)
+    $output = shell_exec("timeout $timeout rclone lsf 'qnap:/share/FTP/processwire/' 2>&1");
+
+    // Se non c'è output, presumiamo non disponibile
+    if ($output === null || $output === false || trim($output) === '') {
+        return false;
+    }
+
+    // Se nell'output compaiono pattern di errore, consideriamo il QNAP non disponibile
+    $errorPatterns = ['error', 'timeout', 'connection refused', 'no such host', 'failed', 'refused', 'unreachable', 'network'];
+    $outputLower = strtolower($output);
+    foreach ($errorPatterns as $pattern) {
+        if (strpos($outputLower, $pattern) !== false) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function safeRcloneCommand($command, $timeout = 5) {
+    // Esegue comando rclone con timeout e gestione errori, senza usare exec
+    $fullCommand = "timeout $timeout $command 2>&1";
+    $output = shell_exec($fullCommand);
+
+    if ($output === null || $output === false) {
+        return ['error' => true, 'message' => 'Server di backup non disponibile'];
+    }
+
+    $trimmed = trim($output);
+    if ($trimmed === '') {
+        return ['error' => true, 'message' => 'Server di backup non disponibile'];
+    }
+
+    // Controllo basilare di errori nel testo
+    $errorPatterns = ['error', 'timeout', 'connection refused', 'no such host', 'failed', 'refused', 'unreachable', 'network'];
+    $outputLower = strtolower($trimmed);
+    foreach ($errorPatterns as $pattern) {
+        if (strpos($outputLower, $pattern) !== false) {
+            return ['error' => true, 'message' => 'Server di backup non disponibile'];
+        }
+    }
+
+    return ['error' => false, 'output' => $trimmed];
+}
+
 function getLastBackup($domain) {
-    $output = shell_exec("rclone lsf 'qnap:/share/FTP/processwire/$domain/current/' 2>/dev/null | sort | tail -1");
-    if (!empty(trim($output))) {
-        $date = parseBackupDate(trim($output));
+    // Verifica disponibilità QNAP prima di procedere
+    if (!isQnapAvailable(3)) {
+        return 'Server di backup non disponibile';
+    }
+    
+    $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/current/' | sort | tail -1", 5);
+    if (!$result['error'] && !empty(trim($result['output']))) {
+        $date = parseBackupDate(trim($result['output']));
         if ($date) return $date;
     }
-    $output = shell_exec("rclone lsf 'qnap:/share/FTP/processwire/$domain/snapshots/' 2>/dev/null | sort | tail -1");
-    if (!empty(trim($output))) {
-        $date = parseBackupDate(trim($output));
+    
+    $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/snapshots/' | sort | tail -1", 5);
+    if (!$result['error'] && !empty(trim($result['output']))) {
+        $date = parseBackupDate(trim($result['output']));
         if ($date) return $date;
     }
+    
+    // Se il QNAP non è disponibile, restituisci messaggio di errore
+    if ($result['error']) {
+        return 'Server di backup non disponibile';
+    }
+    
     return null;
 }
 
 function getSnapshots($domain) {
     $all = [];
-    $output = shell_exec("rclone lsf 'qnap:/share/FTP/processwire/$domain/current/' 2>/dev/null");
-    if (!empty($output)) {
-        foreach (array_filter(explode("\n", trim($output))) as $f) {
+    
+    // Verifica disponibilità QNAP prima di procedere
+    if (!isQnapAvailable(3)) {
+        return ['error' => 'Server di backup non disponibile'];
+    }
+    
+    $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/current/'", 5);
+    if (!$result['error'] && !empty($result['output'])) {
+        foreach (array_filter(explode("\n", trim($result['output']))) as $f) {
             if (strpos($f, '.tar.gz') === false) continue;
             $date = parseBackupDate($f);
             $all[] = ['name' => $f, 'date' => $date ?: $f, 'type' => 'current'];
         }
     }
-    $output = shell_exec("rclone lsf 'qnap:/share/FTP/processwire/$domain/snapshots/' 2>/dev/null");
-    if (!empty($output)) {
-        foreach (array_filter(explode("\n", trim($output))) as $f) {
+    
+    $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/snapshots/'", 5);
+    if (!$result['error'] && !empty($result['output'])) {
+        foreach (array_filter(explode("\n", trim($result['output']))) as $f) {
             if (strpos($f, '.tar.gz') === false) continue;
             $date = parseBackupDate($f);
             $all[] = ['name' => $f, 'date' => $date ?: $f, 'type' => 'snapshot'];
         }
     }
+    
+    // Se il QNAP non è disponibile, restituisci messaggio di errore
+    if ($result['error']) {
+        return ['error' => 'Server di backup non disponibile'];
+    }
+    
     usort($all, fn($a, $b) => strcmp($b['name'], $a['name']));
     return array_slice($all, 0, 30);
 }
@@ -240,14 +312,23 @@ if (isAuthenticated() && isset($_GET['action'])) {
         case 'backup-size':
             $domain = $_GET['domain'] ?? '';
             if ($domain && preg_match('/^[a-z0-9.-]+$/i', $domain)) {
-                $backupSize = shell_exec("rclone size 'qnap:/share/FTP/processwire/$domain/' --json 2>/dev/null");
+                // Verifica disponibilità QNAP prima di procedere
+                if (!isQnapAvailable(3)) {
+                    echo json_encode(['size' => 'Server di backup non disponibile', 'error' => true]);
+                    exit;
+                }
+                
+                $result = safeRcloneCommand("rclone size 'qnap:/share/FTP/processwire/$domain/' --json", 5);
                 $size = '0M';
-                if ($backupSize) {
-                    $json = json_decode($backupSize, true);
+                if (!$result['error'] && !empty($result['output'])) {
+                    $json = json_decode($result['output'], true);
                     if (isset($json['bytes'])) {
                         $mb = $json['bytes'] / 1024 / 1024;
                         $size = $mb >= 1024 ? round($mb/1024, 1) . 'G' : round($mb) . 'M';
                     }
+                } else {
+                    echo json_encode(['size' => 'Server di backup non disponibile', 'error' => true]);
+                    exit;
                 }
                 echo json_encode(['size' => $size]);
             } else {
@@ -273,15 +354,17 @@ if (isAuthenticated() && isset($_GET['action'])) {
                 'used' => disk_total_space('/') - disk_free_space('/')
             ];
             // Spazio QNAP backup - con timeout e gestione errori
-            $qnapOutput = shell_exec("timeout 5 rclone size 'qnap:/share/FTP/processwire/' --json 2>/dev/null");
-            $qnapData = json_decode($qnapOutput, true);
+            $result = safeRcloneCommand("rclone size 'qnap:/share/FTP/processwire/' --json", 5);
             $qnap = null;
             // Solo se abbiamo dati validi (non null e con bytes)
-            if ($qnapData && isset($qnapData['bytes'])) {
-                $qnap = [
-                    'used' => $qnapData['bytes'],
-                    'limit' => 500 * 1000000000 // 500GB
-                ];
+            if (!$result['error'] && !empty($result['output'])) {
+                $qnapData = json_decode($result['output'], true);
+                if ($qnapData && isset($qnapData['bytes'])) {
+                    $qnap = [
+                        'used' => $qnapData['bytes'],
+                        'limit' => 500 * 1000000000 // 500GB
+                    ];
+                }
             }
             echo json_encode(['server' => $server, 'qnap' => $qnap]);
             exit;
@@ -392,7 +475,13 @@ if (isAuthenticated() && isset($_GET['action'])) {
         case 'backups':
             $domain = $_GET['domain'] ?? '';
             if ($domain && preg_match('/^[a-z0-9.-]+$/i', $domain)) {
-                echo json_encode(getSnapshots($domain));
+                $snapshots = getSnapshots($domain);
+                // Se getSnapshots restituisce un errore, restituiscilo come JSON
+                if (isset($snapshots['error'])) {
+                    echo json_encode(['error' => $snapshots['error']]);
+                } else {
+                    echo json_encode($snapshots);
+                }
             } else {
                 echo '[]';
             }

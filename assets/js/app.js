@@ -26,7 +26,6 @@ function loadServices() {
 }
 
 function loadDisk() {
-function loadDisk() {
     fetch('?action=disk')
         .then(r => r.json())
         .then(d => {
@@ -148,7 +147,7 @@ function loadSites() {
                             </div>
                             <div class="site-meta">
                                 <span>💾 ${s.size}</span>
-                                <span>🕐 ${s.lastBackup}</span>
+                                <span>🕐 ${s.lastBackup === 'Server di backup non disponibile' ? '⚠️ ' + s.lastBackup : s.lastBackup}</span>
                             </div>
                         </div>
                     </div>
@@ -190,7 +189,7 @@ function loadSites() {
                                 <div class="toggle ${s.backupEnabled ? 'active' : ''}" onclick="toggleBackup('${s.domain}', ${!s.backupEnabled}); event.stopPropagation();"></div>
                                 <span class="toggle-label">${s.backupEnabled ? 'Attivo' : 'Disattivo'}</span>
                             </div>
-                            <div class="panel-row" style="margin-top:1rem;"><span class="label">Ultimo backup</span><span class="value">${s.lastBackup}</span></div>
+                            <div class="panel-row" style="margin-top:1rem;"><span class="label">Ultimo backup</span><span class="value" style="${s.lastBackup === 'Server di backup non disponibile' ? 'color:var(--warning)' : ''}">${s.lastBackup === 'Server di backup non disponibile' ? '⚠️ ' + s.lastBackup : s.lastBackup}</span></div>
                         </div>
                         <div class="panel-actions">
                             <button class="btn btn-secondary btn-sm" onclick="doBackup('${s.domain}'); event.stopPropagation();">📦 Backup Ora</button>
@@ -219,25 +218,49 @@ function toggleSite(domain) {
 function loadBackupSize(domain) {
     const el = document.getElementById('backup-size-' + domain);
     if (el) {
-        fetch('?action=backup-size&domain=' + domain).then(r => r.json()).then(d => {
-            el.textContent = d.size;
-        });
+        fetch('?action=backup-size&domain=' + domain)
+            .then(r => r.json())
+            .then(d => {
+                if (d.error) {
+                    el.textContent = '⚠️ ' + d.size;
+                    el.style.color = 'var(--warning)';
+                } else {
+                    el.textContent = d.size;
+                    el.style.color = '';
+                }
+            })
+            .catch(err => {
+                el.textContent = '⚠️ Errore';
+                el.style.color = 'var(--warning)';
+            });
     }
 }
 
 function loadSnapshots(domain) {
-    fetch('?action=backups&domain=' + domain).then(r => r.json()).then(snaps => {
-        const c = document.getElementById('snapshots-' + domain);
-        if (snaps.length === 0) {
-            c.innerHTML = '<div style="color:var(--text-muted)">Nessun backup</div>';
-            return;
-        }
-        c.innerHTML = snaps.map(s => {
-            const typeLabel = s.type === 'current' ? '🔄' : '📦';
-            const typeClass = s.type === 'current' ? 'color:#60a5fa' : 'color:#4ade80';
-            return `<div class="snapshot-item" style="cursor:pointer" onclick="restoreBackup('${domain}', '${s.name}', '${s.date}')"><span style="${typeClass}">${typeLabel} ${s.date}</span><span style="color:var(--text-muted);font-size:0.7rem">${s.type}</span></div>`;
-        }).join('');
-    });
+    fetch('?action=backups&domain=' + domain)
+        .then(r => r.json())
+        .then(snaps => {
+            const c = document.getElementById('snapshots-' + domain);
+            if (snaps.error) {
+                c.innerHTML = '<div style="color:var(--warning)">⚠️ ' + snaps.error + '</div>';
+                return;
+            }
+            if (snaps.length === 0) {
+                c.innerHTML = '<div style="color:var(--text-muted)">Nessun backup</div>';
+                return;
+            }
+            c.innerHTML = snaps.map(s => {
+                const typeLabel = s.type === 'current' ? '🔄' : '📦';
+                const typeClass = s.type === 'current' ? 'color:#60a5fa' : 'color:#4ade80';
+                return `<div class="snapshot-item" style="cursor:pointer" onclick="restoreBackup('${domain}', '${s.name}', '${s.date}')"><span style="${typeClass}">${typeLabel} ${s.date}</span><span style="color:var(--text-muted);font-size:0.7rem">${s.type}</span></div>`;
+            }).join('');
+        })
+        .catch(err => {
+            const c = document.getElementById('snapshots-' + domain);
+            if (c) {
+                c.innerHTML = '<div style="color:var(--warning)">⚠️ Errore caricamento backup</div>';
+            }
+        });
 }
 
 function restoreBackup(domain, filename, dateLabel) {
