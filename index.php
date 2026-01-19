@@ -89,58 +89,90 @@ function getLastBackup($domain, $skipCheck = false) {
     if (!$skipCheck && !isQnapAvailable(3)) {
         return 'Server di backup non disponibile';
     }
-    
+
+    // Cerca prima in current/
     $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/current/' | sort | tail -1", 5);
     if (!$result['error'] && !empty(trim($result['output']))) {
         $date = parseBackupDate(trim($result['output']));
         if ($date) return $date;
     }
-    
+
+    // Se current/ non ha backup validi, prova snapshots/ (ignora errore "directory not found")
     $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/snapshots/' | sort | tail -1", 5);
     if (!$result['error'] && !empty(trim($result['output']))) {
         $date = parseBackupDate(trim($result['output']));
         if ($date) return $date;
     }
-    
-    // Se il QNAP non è disponibile, restituisci messaggio di errore
-    if ($result['error']) {
-        return 'Server di backup non disponibile';
-    }
-    
+
+    // Nessun backup trovato (ma QNAP è raggiungibile)
     return null;
+}
+
+function getAllBackupsFromQnap($timeout = 15) {
+    // Recupera TUTTI i backup con una sola chiamata rclone ricorsiva
+    // Usa --files-only perché --include non funziona correttamente con --recursive
+    $output = shell_exec("timeout $timeout rclone lsf 'qnap:/share/FTP/processwire/' --recursive --files-only 2>/dev/null");
+
+    if ($output === null || trim($output) === '') {
+        return null; // QNAP non disponibile
+    }
+
+    // Parsa i risultati e raggruppa per dominio
+    $backups = [];
+    foreach (explode("\n", $output) as $line) {
+        $line = trim($line);
+        if (empty($line) || strpos($line, '.tar.gz') === false) continue;
+
+        // Formato: dominio/current/file.tar.gz o dominio/snapshots/file.tar.gz
+        if (preg_match('#^([^/]+)/(current|snapshots)/(.+\.tar\.gz)$#', $line, $m)) {
+            $domain = $m[1];
+            $file = $m[3];
+            if (!isset($backups[$domain])) {
+                $backups[$domain] = [];
+            }
+            $backups[$domain][] = $file;
+        }
+    }
+
+    // Per ogni dominio, trova il backup più recente
+    $lastBackups = [];
+    foreach ($backups as $domain => $files) {
+        rsort($files); // Ordina decrescente (più recente prima)
+        $date = parseBackupDate($files[0]);
+        $lastBackups[$domain] = $date ?: null;
+    }
+
+    return $lastBackups;
 }
 
 function getSnapshots($domain) {
     $all = [];
-    
+
     // Verifica disponibilità QNAP prima di procedere
     if (!isQnapAvailable(3)) {
         return ['error' => 'Server di backup non disponibile'];
     }
-    
-    $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/current/'", 5);
-    if (!$result['error'] && !empty($result['output'])) {
-        foreach (array_filter(explode("\n", trim($result['output']))) as $f) {
+
+    // Usa shell_exec diretto per evitare falsi positivi di safeRcloneCommand
+    // (che cattura "error" nel testo anche per "directory not found")
+    $currentOutput = shell_exec("timeout 5 rclone lsf 'qnap:/share/FTP/processwire/$domain/current/' 2>/dev/null");
+    if ($currentOutput && trim($currentOutput) !== '') {
+        foreach (array_filter(explode("\n", trim($currentOutput))) as $f) {
             if (strpos($f, '.tar.gz') === false) continue;
             $date = parseBackupDate($f);
             $all[] = ['name' => $f, 'date' => $date ?: $f, 'type' => 'current'];
         }
     }
-    
-    $result = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$domain/snapshots/'", 5);
-    if (!$result['error'] && !empty($result['output'])) {
-        foreach (array_filter(explode("\n", trim($result['output']))) as $f) {
+
+    $snapshotsOutput = shell_exec("timeout 5 rclone lsf 'qnap:/share/FTP/processwire/$domain/snapshots/' 2>/dev/null");
+    if ($snapshotsOutput && trim($snapshotsOutput) !== '') {
+        foreach (array_filter(explode("\n", trim($snapshotsOutput))) as $f) {
             if (strpos($f, '.tar.gz') === false) continue;
             $date = parseBackupDate($f);
             $all[] = ['name' => $f, 'date' => $date ?: $f, 'type' => 'snapshot'];
         }
     }
-    
-    // Se il QNAP non è disponibile, restituisci messaggio di errore
-    if ($result['error']) {
-        return ['error' => 'Server di backup non disponibile'];
-    }
-    
+
     usort($all, fn($a, $b) => strcmp($b['name'], $a['name']));
     return array_slice($all, 0, 30);
 }
@@ -243,31 +275,21 @@ if (isAuthenticated() && isset($_GET['action'])) {
             $sites = [];
             $backupEnabled = getBackupEnabled();
             $phpVersions = getAvailablePhpVersions();
-            
-            // Verifica disponibilità QNAP UNA SOLA VOLTA prima del loop per ottimizzare performance
-            $qnapAvailable = isQnapAvailable(3);
-            
+
             foreach (glob(SITES_DIR . '/*/') as $dir) {
                 $domain = basename($dir);
                 if ($domain === 'vm1.arkenu.it') continue;
-                
+
                 $hasSSL = file_exists("/etc/letsencrypt/live/$domain/fullchain.pem");
                 $phpVersion = getSitePhpVersion($domain);
                 $backupOn = in_array($domain, $backupEnabled);
                 $details = getSiteDetails($domain, $dir);
-                
+
                 $totalMb = toMb($details['sizeFiles']) + toMb($details['sizeDb']);
                 $totalSize = formatSize($totalMb);
-                
-                // Se QNAP non è disponibile, usa messaggio diretto senza chiamare getLastBackup
-                $lastBackup = 'Disattivo';
-                if ($backupOn) {
-                    if ($qnapAvailable) {
-                        $lastBackup = getLastBackup($domain, true) ?: 'Mai'; // skipCheck=true perché già verificato
-                    } else {
-                        $lastBackup = 'Server di backup non disponibile';
-                    }
-                }
+
+                // Non carichiamo i dati backup qui - verranno caricati via AJAX (lazy loading)
+                $lastBackup = 'Caricamento...';
                 
                 $sites[] = [
                     'domain' => $domain,
@@ -304,7 +326,17 @@ if (isAuthenticated() && isset($_GET['action'])) {
             });
             echo json_encode($sites);
             exit;
-            
+
+        case 'all-backups':
+            // Endpoint separato per caricare tutti i backup via AJAX (lazy loading)
+            $allBackups = getAllBackupsFromQnap(15);
+            if ($allBackups === null) {
+                echo json_encode(['error' => 'Server di backup non disponibile']);
+            } else {
+                echo json_encode(['backups' => $allBackups]);
+            }
+            exit;
+
         case 'php-versions':
             echo json_encode(getAvailablePhpVersions());
             exit;
@@ -360,16 +392,19 @@ if (isAuthenticated() && isset($_GET['action'])) {
             exit;
             
         case 'disk':
-            // Spazio server locale
+            // Solo spazio server locale (veloce) - QNAP viene caricato separatamente
             $server = [
                 'total' => disk_total_space('/'),
                 'free' => disk_free_space('/'),
                 'used' => disk_total_space('/') - disk_free_space('/')
             ];
-            // Spazio QNAP backup - con timeout e gestione errori
-            $result = safeRcloneCommand("rclone size 'qnap:/share/FTP/processwire/' --json", 5);
+            echo json_encode(['server' => $server, 'qnap' => null]);
+            exit;
+
+        case 'disk-qnap':
+            // Spazio QNAP backup - endpoint separato per lazy loading
+            $result = safeRcloneCommand("rclone size 'qnap:/share/FTP/processwire/' --json", 10);
             $qnap = null;
-            // Solo se abbiamo dati validi (non null e con bytes)
             if (!$result['error'] && !empty($result['output'])) {
                 $qnapData = json_decode($result['output'], true);
                 if ($qnapData && isset($qnapData['bytes'])) {
@@ -379,7 +414,7 @@ if (isAuthenticated() && isset($_GET['action'])) {
                     ];
                 }
             }
-            echo json_encode(['server' => $server, 'qnap' => $qnap]);
+            echo json_encode(['qnap' => $qnap]);
             exit;
 
         case "system-status":
@@ -500,98 +535,240 @@ if (isAuthenticated() && isset($_GET['action'])) {
             }
             exit;
 
+        case 'list-qnap-backups':
+            // Lista tutte le cartelle di backup disponibili sul QNAP per import
+            $result = safeRcloneCommand("rclone lsd 'qnap:/share/FTP/processwire/' 2>/dev/null | awk '{print \$NF}'", 10);
+            if ($result['error']) {
+                echo json_encode(['error' => 'Server di backup non disponibile']);
+                exit;
+            }
+            $folders = array_filter(explode("\n", trim($result['output'])));
+            $backups = [];
+            foreach ($folders as $folder) {
+                if ($folder === '_system' || empty($folder)) continue;
+                // Lista i backup in current/ per ogni cartella
+                $filesResult = safeRcloneCommand("rclone lsf 'qnap:/share/FTP/processwire/$folder/current/' 2>/dev/null | sort -r | head -5", 5);
+                if (!$filesResult['error'] && !empty($filesResult['output'])) {
+                    foreach (array_filter(explode("\n", trim($filesResult['output']))) as $file) {
+                        if (strpos($file, '.tar.gz') !== false) {
+                            $date = parseBackupDate($file);
+                            $backups[] = [
+                                'site' => $folder,
+                                'file' => $file,
+                                'path' => "/processwire/$folder/current/$file",
+                                'date' => $date ?: $file,
+                                'type' => 'current'
+                            ];
+                        }
+                    }
+                }
+            }
+            // Ordina per data decrescente
+            usort($backups, fn($a, $b) => strcmp($b['file'], $a['file']));
+            echo json_encode($backups);
+            exit;
+
         case 'create':
             $domain = $_POST['domain'] ?? '';
             $sftp = isset($_POST['sftp']) && $_POST['sftp'] ? 'sftp' : '';
             $phpVersion = $_POST['php_version'] ?? '8.3';
             $importDb = isset($_POST['import_db']) && $_POST['import_db'];
             $importFiles = isset($_POST['import_files']) && $_POST['import_files'];
-            
+            $qnapBackupPath = $_POST['qnap_backup'] ?? '';
+
             if (!$domain || !preg_match('/^[a-z0-9.-]+\.[a-z]{2,}$/i', $domain)) {
                 echo json_encode(['success' => false, 'error' => 'Dominio non valido']);
                 exit;
             }
-            
-            // Salva file temporanei
+
+            // Verifica se il sito esiste già
+            if (is_dir("/var/www/sites/$domain")) {
+                echo json_encode(['success' => false, 'error' => 'Il sito esiste già']);
+                exit;
+            }
+
+            // Genera job ID univoco
+            $jobId = 'job_' . uniqid();
+            $statusFile = '/var/run/pwhost/' . $jobId . '.json';
+
+            // Inizializza file di stato
+            file_put_contents($statusFile, json_encode([
+                'status' => 'running',
+                'message' => 'Avvio creazione sito...',
+                'percent' => 5,
+                'timestamp' => time()
+            ]));
+            chmod($statusFile, 0666);
+
+            // Se c'è un backup QNAP da importare, usa il workflow asincrono
+            if ($qnapBackupPath && preg_match('#^/processwire/[a-z0-9.-]+/current/[a-z0-9._-]+\.tar\.gz$#i', $qnapBackupPath)) {
+                // Creazione asincrona con import backup
+                $bgCmd = "sudo /usr/local/bin/pw-create-async " .
+                    escapeshellarg($statusFile) . " " .
+                    escapeshellarg($domain) . " " .
+                    escapeshellarg($phpVersion) . " " .
+                    escapeshellarg($sftp) . " " .
+                    escapeshellarg($qnapBackupPath);
+
+                shell_exec("echo " . escapeshellarg($bgCmd) . " | at now 2>/dev/null");
+
+                echo json_encode([
+                    'success' => true,
+                    'async' => true,
+                    'jobId' => $jobId,
+                    'message' => 'Creazione sito con import backup avviata'
+                ]);
+                exit;
+            }
+
+            // Altrimenti usa il workflow asincrono semplice (senza import QNAP ma sempre asincrono)
+            // per evitare problemi con PHP-FPM restart
+
+            // Se ci sono file da uploadare, gestiscili prima
             $dumpFile = '';
             $siteZip = '';
-            
+
             if ($importDb && isset($_FILES['sql_dump']) && $_FILES['sql_dump']['error'] === UPLOAD_ERR_OK) {
                 $ext = pathinfo($_FILES['sql_dump']['name'], PATHINFO_EXTENSION);
                 $dumpFile = '/tmp/' . uniqid('dump_') . '.' . $ext;
                 move_uploaded_file($_FILES['sql_dump']['tmp_name'], $dumpFile);
                 chmod($dumpFile, 0644);
             }
-            
+
             if ($importFiles && isset($_FILES['site_zip']) && $_FILES['site_zip']['error'] === UPLOAD_ERR_OK) {
                 $siteZip = '/tmp/' . uniqid('site_') . '.zip';
                 move_uploaded_file($_FILES['site_zip']['tmp_name'], $siteZip);
                 chmod($siteZip, 0644);
             }
-            
-            // Crea sito
-            $cmd = "sudo /usr/local/bin/pw-create " . escapeshellarg($domain) . " " . escapeshellarg($phpVersion);
-            if ($sftp) $cmd .= " sftp";
-            if ($dumpFile) $cmd .= " " . escapeshellarg($dumpFile);
-            
-            $output = shell_exec($cmd . " 2>&1");
-            
-            // Estrai ZIP contenuti se fornito
-            $extractOutput = '';
-            if ($siteZip && file_exists($siteZip)) {
-                $siteDir = "/var/www/sites/$domain/public";
-                $extractOutput = shell_exec("cd " . escapeshellarg($siteDir) . " && unzip -o " . escapeshellarg($siteZip) . " 2>&1");
-                
-                // Fix permessi
-                shell_exec("chown -R www-data:www-data " . escapeshellarg($siteDir));
-                
-                // Aggiorna config.php con nuove credenziali DB
-                $configFile = "$siteDir/site/config.php";
-                if (file_exists($configFile)) {
-                    $dbCredsFile = "/var/www/sites/$domain/.db-credentials";
-                    if (file_exists($dbCredsFile)) {
-                        $creds = file_get_contents($dbCredsFile);
-                        preg_match('/Database:\s*(\S+)/', $creds, $mDb);
-                        preg_match('/User:\s*(\S+)/', $creds, $mUser);
-                        preg_match('/Pass:\s*(\S+)/', $creds, $mPass);
-                        
-                        if ($mDb && $mUser && $mPass) {
-                            $cmd = "sudo /usr/local/bin/pw-update-config " . 
-                                escapeshellarg($configFile) . " " .
-                                escapeshellarg($mDb[1]) . " " .
-                                escapeshellarg($mUser[1]) . " " .
-                                escapeshellarg($mPass[1]) . " " .
-                                escapeshellarg($domain);
-                            shell_exec($cmd);
-                            $extractOutput .= "\nConfig.php aggiornato con nuove credenziali DB";
-                        }
-                    }
+
+            // Costruisci comando per pw-create-async
+            // pw-create supporta già il dump SQL come parametro
+            $bgCmd = "sudo /usr/local/bin/pw-create-async " .
+                escapeshellarg($statusFile) . " " .
+                escapeshellarg($domain) . " " .
+                escapeshellarg($phpVersion) . " " .
+                escapeshellarg($sftp);
+
+            // Se c'è solo dump SQL (senza ZIP), passalo a pw-create tramite pw-create-async
+            // pw-create accetta il dump come ultimo parametro
+            if ($dumpFile && !$siteZip) {
+                // Il dump viene passato direttamente a pw-create che lo gestisce internamente
+                $bgCmd .= " " . escapeshellarg($dumpFile);
+                shell_exec("echo " . escapeshellarg($bgCmd) . " | at now 2>/dev/null");
+
+                echo json_encode([
+                    'success' => true,
+                    'async' => true,
+                    'jobId' => $jobId,
+                    'message' => 'Creazione sito con import database avviata'
+                ]);
+                exit;
+            }
+
+            // Se c'è ZIP (con o senza dump), usiamo uno script wrapper
+            if ($siteZip) {
+                // Crea uno script temporaneo che gestisce tutto il flusso
+                $wrapperScript = '/usr/local/lib/pwhost/scripts/' . $jobId . '.sh';
+                $dbName = preg_replace('/[.-]/', '_', substr($domain, 0, 16));
+
+                $scriptContent = "#!/bin/bash\n";
+                $scriptContent .= "STATUS_FILE=" . escapeshellarg($statusFile) . "\n";
+                $scriptContent .= "DOMAIN=" . escapeshellarg($domain) . "\n";
+                $scriptContent .= "SITE_DIR=\"/var/www/sites/\$DOMAIN\"\n\n";
+
+                $scriptContent .= "log_status() {\n";
+                $scriptContent .= "    echo \"{\\\"status\\\":\\\"\$1\\\",\\\"message\\\":\\\"\$2\\\",\\\"percent\\\":\$3,\\\"timestamp\\\":\$(date +%s)}\" > \"\$STATUS_FILE\"\n";
+                $scriptContent .= "    chmod 666 \"\$STATUS_FILE\" 2>/dev/null\n";
+                $scriptContent .= "}\n\n";
+
+                $scriptContent .= "log_status \"running\" \"Creazione sito base...\" 10\n";
+                $scriptContent .= "/usr/local/bin/pw-create " . escapeshellarg($domain) . " " . escapeshellarg($phpVersion);
+                if ($sftp) $scriptContent .= " sftp";
+                $scriptContent .= " 2>&1\n";
+                $scriptContent .= "if [ \$? -ne 0 ]; then\n";
+                $scriptContent .= "    log_status \"error\" \"Errore creazione sito base\" 0\n";
+                $scriptContent .= "    exit 1\n";
+                $scriptContent .= "fi\n\n";
+
+                $scriptContent .= "log_status \"running\" \"Estrazione file ZIP...\" 50\n";
+                $scriptContent .= "cd \"\$SITE_DIR/public\" && unzip -o " . escapeshellarg($siteZip) . " 2>&1\n";
+                $scriptContent .= "chown -R www-data:www-data \"\$SITE_DIR/public\"\n";
+                $scriptContent .= "rm -f " . escapeshellarg($siteZip) . "\n\n";
+
+                if ($dumpFile) {
+                    $scriptContent .= "log_status \"running\" \"Importazione database...\" 75\n";
+                    $scriptContent .= "mysql " . escapeshellarg($dbName) . " < " . escapeshellarg($dumpFile) . " 2>&1\n";
+                    $scriptContent .= "rm -f " . escapeshellarg($dumpFile) . "\n\n";
                 }
-                
-                unlink($siteZip);
+
+                // Aggiorna config.php ProcessWire se presente
+                $scriptContent .= "# Aggiorna config.php con nuove credenziali se esiste\n";
+                $scriptContent .= "if [ -f \"\$SITE_DIR/public/site/config.php\" ] && [ -f \"\$SITE_DIR/.db-credentials\" ]; then\n";
+                $scriptContent .= "    log_status \"running\" \"Aggiornamento configurazione...\" 90\n";
+                $scriptContent .= "    DB_NAME=\$(grep 'Database:' \"\$SITE_DIR/.db-credentials\" | awk '{print \$2}')\n";
+                $scriptContent .= "    DB_USER=\$(grep 'User:' \"\$SITE_DIR/.db-credentials\" | awk '{print \$2}')\n";
+                $scriptContent .= "    DB_PASS=\$(grep 'Pass:' \"\$SITE_DIR/.db-credentials\" | awk '{print \$2}')\n";
+                $scriptContent .= "    sudo /usr/local/bin/pw-update-config \"\$SITE_DIR/public/site/config.php\" \"\$DB_NAME\" \"\$DB_USER\" \"\$DB_PASS\" \"\$DOMAIN\" 2>/dev/null\n";
+                $scriptContent .= "fi\n\n";
+
+                $scriptContent .= "log_status \"completed\" \"Sito creato con file importati!\" 100\n";
+                $scriptContent .= "rm -f " . escapeshellarg($wrapperScript) . "\n";
+
+                file_put_contents($wrapperScript, $scriptContent);
+                chmod($wrapperScript, 0755);
+
+                shell_exec("echo " . escapeshellarg("sudo " . $wrapperScript) . " | at now 2>/dev/null");
+
+                echo json_encode([
+                    'success' => true,
+                    'async' => true,
+                    'jobId' => $jobId,
+                    'message' => 'Creazione sito con import file avviata'
+                ]);
+                exit;
             }
-            
-            // Pulizia
-            if ($dumpFile && file_exists($dumpFile)) {
-                unlink($dumpFile);
-            }
-            
-            $fullOutput = $output;
-            if ($extractOutput) {
-                $fullOutput .= "\n--- Estrazione ZIP ---\n" . $extractOutput;
-            }
-            
-            echo json_encode(['success' => true, 'output' => $fullOutput]);
-            
-            // Chiudi connessione HTTP prima del reload
-            if (function_exists('fastcgi_finish_request')) {
-                fastcgi_finish_request();
-            }
-            
-            // Reload asincrono dei servizi
-            shell_exec('nohup bash -c "sleep 2; systemctl reload nginx; systemctl reload php8.3-fpm 2>/dev/null; systemctl reload php7.3-fpm 2>/dev/null" >/dev/null 2>&1 &');
+
+            // Creazione semplice senza file
+            shell_exec("echo " . escapeshellarg($bgCmd) . " | at now 2>/dev/null");
+
+            echo json_encode([
+                'success' => true,
+                'async' => true,
+                'jobId' => $jobId,
+                'message' => 'Creazione sito avviata'
+            ]);
             exit;
-            
+
+        case 'create-status':
+            // Polling stato creazione sito asincrona
+            $jobId = $_GET['job'] ?? '';
+            $jobId = preg_replace('/[^a-z0-9_]/i', '', $jobId);
+            $statusFile = '/var/run/pwhost/' . $jobId . '.json';
+
+            if (!$jobId || !file_exists($statusFile)) {
+                echo json_encode(['status' => 'unknown', 'message' => 'Job non trovato']);
+                exit;
+            }
+
+            $content = file_get_contents($statusFile);
+            $status = json_decode($content, true);
+
+            if (!$status) {
+                echo json_encode(['status' => 'error', 'message' => 'Errore lettura stato']);
+                exit;
+            }
+
+            // Se completato o errore, elimina il file di stato dopo un po'
+            if (in_array($status['status'], ['completed', 'error'])) {
+                // Mantieni il file per 60 secondi per permettere al client di leggerlo
+                if (isset($status['timestamp']) && (time() - $status['timestamp']) > 60) {
+                    unlink($statusFile);
+                }
+            }
+
+            echo json_encode($status);
+            exit;
+
         case 'ssl':
             $domain = $_GET['domain'] ?? '';
             if ($domain && preg_match('/^[a-z0-9.-]+$/i', $domain)) {
@@ -851,8 +1028,25 @@ if (!isAuthenticated()):
                 </div>
                 <div class="form-group">
                     <label class="checkbox-label">
+                        <input type="checkbox" name="import_qnap" id="import-qnap-check" value="1" onchange="toggleQnapBackup()">
+                        <span>📦 Importa backup completo da QNAP</span>
+                    </label>
+                </div>
+                <div class="form-group" id="qnap-backup-group" style="display:none;">
+                    <label>Seleziona backup da importare</label>
+                    <div style="display:flex;gap:10px;align-items:center;">
+                        <select name="qnap_backup" id="qnap-backup-select" class="form-select" style="flex:1;">
+                            <option value="">-- Carica lista backup --</option>
+                        </select>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="refreshBackupList()">🔄</button>
+                    </div>
+                    <small style="color:var(--text-muted);margin-top:5px;display:block;">Include database e tutti i file del sito originale</small>
+                </div>
+                <hr style="border:none;border-top:1px solid var(--border-color);margin:15px 0;">
+                <div class="form-group">
+                    <label class="checkbox-label">
                         <input type="checkbox" name="import_files" id="import-files-check" value="1" onchange="toggleFilesUpload()">
-                        <span>Importa file sito da ZIP</span>
+                        <span>Importa file sito da ZIP (upload manuale)</span>
                     </label>
                 </div>
                 <div class="form-group" id="files-upload-group" style="display:none;">
@@ -862,7 +1056,7 @@ if (!isAuthenticated()):
                 <div class="form-group">
                     <label class="checkbox-label">
                         <input type="checkbox" name="import_db" id="import-db-check" value="1" onchange="toggleDumpUpload()">
-                        <span>Importa database da dump SQL</span>
+                        <span>Importa database da dump SQL (upload manuale)</span>
                     </label>
                 </div>
                 <div class="form-group" id="dump-upload-group" style="display:none;">

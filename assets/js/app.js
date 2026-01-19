@@ -29,34 +29,48 @@ function loadDisk() {
     fetch('?action=disk')
         .then(r => r.json())
         .then(d => {
-            // Server locale
+            // Server locale (carica subito)
             const sUsed = (d.server.used / 1000000000).toFixed(1);
             const sTotal = (d.server.total / 1000000000).toFixed(1);
             const sPct = (d.server.used / d.server.total * 100).toFixed(1);
-            
-            let html = `
+
+            document.getElementById('disk-info').innerHTML = `
                 <div class="disk-info"><span>Server</span><span>${sUsed} / ${sTotal} GB (${sPct}%)</span></div>
-                <div class="disk-bar"><div class="disk-fill" style="width:${sPct}%"></div></div>`;
-            
-            // QNAP backup - con gestione errori
-            if (d.qnap && d.qnap.used !== undefined && d.qnap.limit) {
-                const qUsed = (d.qnap.used / 1000000000).toFixed(1);
-                const qLimit = (d.qnap.limit / 1000000000).toFixed(0);
-                const qPct = (d.qnap.used / d.qnap.limit * 100).toFixed(1);
-                html += `
-                    <div class="disk-info" style="margin-top:0.5rem"><span>QNAP Backup</span><span>${qUsed} / ${qLimit} GB (${qPct}%)</span></div>
-                    <div class="disk-bar"><div class="disk-fill" style="width:${qPct}%;background:var(--accent-secondary)"></div></div>`;
-            } else {
-                html += `
-                    <div class="disk-info" style="margin-top:0.5rem;color:var(--warning)"><span>⚠️ QNAP Backup</span><span>Non raggiungibile</span></div>`;
-            }
-            
-            document.getElementById('disk-info').innerHTML = html;
+                <div class="disk-bar"><div class="disk-fill" style="width:${sPct}%"></div></div>
+                <div class="disk-info" style="margin-top:0.5rem"><span>QNAP Backup</span><span id="qnap-disk-info">Caricamento...</span></div>
+                <div class="disk-bar"><div class="disk-fill" id="qnap-disk-bar" style="width:0%;background:var(--accent-secondary)"></div></div>`;
+
+            // Carica dati QNAP in background (lazy loading)
+            loadDiskQnap();
         })
         .catch(err => {
             console.error('Errore caricamento disk:', err);
             document.getElementById('disk-info').innerHTML = `
                 <div class="disk-info" style="color:var(--danger)"><span>⚠️ Errore</span><span>Impossibile caricare dati disco</span></div>`;
+        });
+}
+
+function loadDiskQnap() {
+    fetch('?action=disk-qnap')
+        .then(r => r.json())
+        .then(d => {
+            const infoEl = document.getElementById('qnap-disk-info');
+            const barEl = document.getElementById('qnap-disk-bar');
+            if (!infoEl) return;
+
+            if (d.qnap && d.qnap.used !== undefined && d.qnap.limit) {
+                const qUsed = (d.qnap.used / 1000000000).toFixed(1);
+                const qLimit = (d.qnap.limit / 1000000000).toFixed(0);
+                const qPct = (d.qnap.used / d.qnap.limit * 100).toFixed(1);
+                infoEl.textContent = `${qUsed} / ${qLimit} GB (${qPct}%)`;
+                if (barEl) barEl.style.width = qPct + '%';
+            } else {
+                infoEl.innerHTML = '<span style="color:var(--warning)">⚠️ Non raggiungibile</span>';
+            }
+        })
+        .catch(err => {
+            const infoEl = document.getElementById('qnap-disk-info');
+            if (infoEl) infoEl.innerHTML = '<span style="color:var(--warning)">⚠️ Errore</span>';
         });
 }
 
@@ -80,6 +94,70 @@ function toggleFilesUpload() {
     const check = document.getElementById('import-files-check');
     const group = document.getElementById('files-upload-group');
     group.style.display = check.checked ? 'block' : 'none';
+    // Disabilita QNAP se selezionato upload manuale
+    if (check.checked) {
+        document.getElementById('import-qnap-check').checked = false;
+        document.getElementById('qnap-backup-group').style.display = 'none';
+    }
+}
+
+function toggleQnapBackup() {
+    const check = document.getElementById('import-qnap-check');
+    const group = document.getElementById('qnap-backup-group');
+    group.style.display = check.checked ? 'block' : 'none';
+    if (check.checked) {
+        // Disabilita upload manuali se selezionato QNAP
+        document.getElementById('import-files-check').checked = false;
+        document.getElementById('files-upload-group').style.display = 'none';
+        document.getElementById('import-db-check').checked = false;
+        document.getElementById('dump-upload-group').style.display = 'none';
+        // Carica lista backup
+        refreshBackupList();
+    }
+}
+
+let qnapBackupsCache = null;
+
+function refreshBackupList() {
+    const select = document.getElementById('qnap-backup-select');
+    select.innerHTML = '<option value="">Caricamento...</option>';
+    select.disabled = true;
+
+    fetch('?action=list-qnap-backups')
+        .then(r => r.json())
+        .then(backups => {
+            select.disabled = false;
+            if (backups.error) {
+                select.innerHTML = '<option value="">⚠️ ' + backups.error + '</option>';
+                return;
+            }
+            if (backups.length === 0) {
+                select.innerHTML = '<option value="">Nessun backup disponibile</option>';
+                return;
+            }
+            qnapBackupsCache = backups;
+            // Raggruppa per sito
+            const grouped = {};
+            backups.forEach(b => {
+                if (!grouped[b.site]) grouped[b.site] = [];
+                grouped[b.site].push(b);
+            });
+
+            let html = '<option value="">-- Seleziona backup --</option>';
+            Object.keys(grouped).sort().forEach(site => {
+                html += '<optgroup label="' + site + '">';
+                grouped[site].forEach(b => {
+                    html += '<option value="' + b.path + '">' + b.date + ' (' + b.file + ')</option>';
+                });
+                html += '</optgroup>';
+            });
+            select.innerHTML = html;
+        })
+        .catch(err => {
+            select.disabled = false;
+            select.innerHTML = '<option value="">Errore caricamento</option>';
+            console.error('Errore lista backup:', err);
+        });
 }
 
 function copyToClipboard(text) {
@@ -201,7 +279,54 @@ function loadSites() {
             </div>`;
         }
         document.getElementById('sites-list').innerHTML = html;
+        // Carica i dati backup in background (lazy loading per performance)
+        loadBackupData();
     });
+}
+
+function loadBackupData() {
+    fetch('?action=all-backups')
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                // QNAP non disponibile - aggiorna tutti gli elementi con messaggio errore
+                document.querySelectorAll('.site-meta span:last-child').forEach(el => {
+                    if (el.textContent.includes('...') || el.textContent.includes('Caricamento')) {
+                        el.innerHTML = '🕐 ⚠️ Server di backup non disponibile';
+                    }
+                });
+                document.querySelectorAll('[id^="backup-date-"]').forEach(el => {
+                    el.textContent = 'Server di backup non disponibile';
+                    el.style.color = 'var(--warning)';
+                });
+                return;
+            }
+
+            // Aggiorna i dati per ogni sito
+            const backups = data.backups || {};
+            for (const domain in sitesData) {
+                const lastBackup = backups[domain] || 'Nessun backup';
+                sitesData[domain].lastBackup = lastBackup;
+
+                // Aggiorna header nella lista siti
+                const siteItem = document.querySelector(`.site-item[data-domain="${domain}"]`);
+                if (siteItem) {
+                    const metaSpan = siteItem.querySelector('.site-meta span:last-child');
+                    if (metaSpan) {
+                        metaSpan.textContent = '🕐 ' + lastBackup;
+                    }
+                    // Aggiorna nel pannello espanso
+                    const panelRow = siteItem.querySelector('.panel-section:last-of-type .panel-row:last-child .value');
+                    if (panelRow) {
+                        panelRow.textContent = lastBackup;
+                        panelRow.style.color = '';
+                    }
+                }
+            }
+        })
+        .catch(err => {
+            console.error('Errore caricamento backup:', err);
+        });
 }
 
 function toggleSite(domain) {
@@ -347,14 +472,23 @@ function openModal(name) {
     }
 }
 
-function closeModal(name) { 
+function closeModal(name) {
     document.getElementById('modal-' + name).classList.remove('active');
     if (name === 'create') {
+        // Interrompi polling se attivo
+        if (createPollInterval) {
+            clearInterval(createPollInterval);
+            createPollInterval = null;
+        }
+        currentCreateJobId = null;
         document.getElementById('form-create').reset();
         document.getElementById('create-output').style.display = 'none';
+        document.getElementById('create-output').style.color = '';
         document.getElementById('create-progress').style.display = 'none';
+        document.getElementById('progress-fill').classList.remove('indeterminate');
         document.getElementById('dump-upload-group').style.display = 'none';
         document.getElementById('files-upload-group').style.display = 'none';
+        document.getElementById('qnap-backup-group').style.display = 'none';
         document.getElementById('btn-create').disabled = false;
     }
 }
@@ -391,91 +525,144 @@ function doSSL(domain) {
     });
 }
 
+let currentCreateJobId = null;
+let createPollInterval = null;
+
+function pollJobStatus(jobId) {
+    fetch('?action=create-status&job=' + jobId)
+        .then(r => r.json())
+        .then(status => {
+            const out = document.getElementById('create-output');
+            const btn = document.getElementById('btn-create');
+            const fill = document.getElementById('progress-fill');
+
+            if (status.status === 'running') {
+                fill.classList.add('indeterminate');
+                updateProgress(status.percent || 50, status.message || 'Creazione in corso...');
+            } else if (status.status === 'completed') {
+                clearInterval(createPollInterval);
+                createPollInterval = null;
+                fill.classList.remove('indeterminate');
+                updateProgress(100, status.message || 'Completato!');
+                showToast('Sito creato con successo!');
+                btn.disabled = false;
+                setTimeout(() => { closeModal('create'); loadSites(); }, 2000);
+            } else if (status.status === 'error') {
+                clearInterval(createPollInterval);
+                createPollInterval = null;
+                fill.classList.remove('indeterminate');
+                updateProgress(0, status.message || 'Errore');
+                out.style.display = 'block';
+                out.textContent = status.message || 'Errore sconosciuto';
+                out.style.color = 'var(--danger)';
+                btn.disabled = false;
+            }
+        })
+        .catch(err => {
+            console.error('Errore polling:', err);
+        });
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     const form = document.getElementById('form-create');
     if (form) {
         form.addEventListener('submit', function(e) {
             e.preventDefault();
-            
+
             const formData = new FormData(this);
             const out = document.getElementById('create-output');
             const progress = document.getElementById('create-progress');
             const btn = document.getElementById('btn-create');
-            
+
             // Mostra progress bar
             progress.style.display = 'block';
             out.style.display = 'none';
+            out.style.color = '';
             btn.disabled = true;
-            
-            // Simula avanzamento durante upload
-            let percent = 0;
-            const hasFiles = formData.get('site_zip')?.size > 0;
-            const hasDump = formData.get('sql_dump')?.size > 0;
-            
-            updateProgress(5, 'Upload file in corso...');
-            
+
+            // Verifica se è import QNAP
+            const qnapBackup = formData.get('qnap_backup');
+            const hasQnapImport = document.getElementById('import-qnap-check')?.checked && qnapBackup;
+
+            updateProgress(5, hasQnapImport ? 'Avvio import da QNAP...' : 'Upload file in corso...');
+
             const xhr = new XMLHttpRequest();
-            
+
             // Traccia upload progress
             xhr.upload.addEventListener('progress', function(e) {
-                if (e.lengthComputable) {
+                if (e.lengthComputable && !hasQnapImport) {
                     const pct = Math.round((e.loaded / e.total) * 100);
                     updateProgress(pct, 'Upload: ' + pct + '%');
                 }
             });
-            
+
             // Quando upload finisce, mostra stato indeterminato
             xhr.upload.addEventListener('load', function() {
                 document.getElementById('progress-fill').classList.add('indeterminate');
-                document.getElementById('progress-status').textContent = 'Installazione in corso...';
+                document.getElementById('progress-status').textContent = hasQnapImport
+                    ? 'Download backup da QNAP in corso...'
+                    : 'Creazione sito in corso...';
             });
-            
+
             xhr.addEventListener('load', function() {
-                document.getElementById('progress-fill').classList.remove('indeterminate');
-                updateProgress(100, 'Completato!');
                 if (xhr.status === 200) {
                     try {
                         const d = JSON.parse(xhr.responseText);
-                        updateProgress(100, 'Completato!');
-                        out.style.display = 'block';
-                        out.textContent = d.output || d.error;
-                        if (d.success) {
+
+                        if (d.async && d.jobId) {
+                            // Creazione asincrona - avvia polling
+                            currentCreateJobId = d.jobId;
+                            updateProgress(10, d.message || 'Creazione in corso...');
+                            document.getElementById('progress-fill').classList.add('indeterminate');
+
+                            // Avvia polling ogni 2 secondi
+                            createPollInterval = setInterval(() => {
+                                pollJobStatus(d.jobId);
+                            }, 2000);
+
+                            // Prima chiamata immediata
+                            setTimeout(() => pollJobStatus(d.jobId), 500);
+                        } else if (d.success) {
+                            // Vecchio workflow sincrono (fallback)
+                            document.getElementById('progress-fill').classList.remove('indeterminate');
+                            updateProgress(100, 'Completato!');
+                            out.style.display = 'block';
+                            out.textContent = d.output || 'Sito creato';
                             showToast('Sito creato!');
+                            btn.disabled = false;
                             setTimeout(() => { closeModal('create'); loadSites(); }, 2000);
+                        } else {
+                            document.getElementById('progress-fill').classList.remove('indeterminate');
+                            updateProgress(0, 'Errore');
+                            out.style.display = 'block';
+                            out.textContent = d.error || 'Errore sconosciuto';
+                            out.style.color = 'var(--danger)';
+                            btn.disabled = false;
                         }
                     } catch(e) {
+                        document.getElementById('progress-fill').classList.remove('indeterminate');
                         updateProgress(0, 'Errore parsing risposta');
                         out.style.display = 'block';
                         out.textContent = 'Errore: ' + xhr.responseText;
+                        btn.disabled = false;
                     }
                 } else {
+                    document.getElementById('progress-fill').classList.remove('indeterminate');
                     updateProgress(0, 'Errore server: ' + xhr.status);
                     out.style.display = 'block';
                     out.textContent = 'Errore HTTP: ' + xhr.status;
+                    btn.disabled = false;
                 }
-                btn.disabled = false;
             });
-            
+
             xhr.addEventListener('error', function() {
+                document.getElementById('progress-fill').classList.remove('indeterminate');
                 updateProgress(0, 'Errore di rete');
                 out.style.display = 'block';
                 out.textContent = 'Errore di connessione';
                 btn.disabled = false;
             });
-            
-            // Simula progress server-side
-            let serverProgress = 50;
-            const progressInterval = setInterval(() => {
-                if (serverProgress < 90) {
-                    serverProgress += 5;
-                    updateProgress(serverProgress, 'Creazione sito in corso...');
-                }
-            }, 500);
-            
-            xhr.addEventListener('loadend', function() {
-                clearInterval(progressInterval);
-            });
-            
+
             xhr.open('POST', '?action=create');
             xhr.send(formData);
         });
