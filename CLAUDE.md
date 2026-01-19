@@ -1,5 +1,18 @@
 # PWHost Server - Documentazione Claude
 
+---
+
+## ⚠️ ATTENZIONE: SERVER DI PRODUZIONE ⚠️
+
+**Questo è il server di PRODUZIONE con siti live.**
+
+- **NON** fare modifiche senza test preventivi
+- **NON** sperimentare codice non testato
+- Per sviluppo e test usare il **server di staging**
+- Ogni modifica può impattare i siti dei clienti
+
+---
+
 ## Server Info
 
 - **Hostname**: PROCESSWIRE
@@ -121,14 +134,19 @@
 
 ### Aruba DR (Disaster Recovery)
 - **Host**: ftp2.dc1.computing.cloud.it
-- **Protocollo**: FTP (rclone remote "aruba-dr")
-- **Tool**: Restic (backup incrementale)
+- **Protocollo**: FTPS (rclone remote "aruba-dr", explicit_tls=true)
+- **Path**: `/pwhost-backup/`
 - **Schedule**: Ogni notte alle 02:00
+- **Retention**: 2 giorni
+- **Formato**: `pwhost-full-backup_YYYYMMDD.tar.gz.iso` (estensione .iso richiesta da Aruba)
+- **Contenuto**: Backup COMPLETO del server (tutti i siti, tutti i DB, config sistema, certificati SSL)
 
-### Siti con backup attivo
-Configurati in `/etc/pwhost-backup.conf`:
+### Siti con backup QNAP attivo
+Configurati in `/etc/pwhost-backup.conf` (solo per backup frequenti QNAP):
 - claviere.it
 - cato2.it
+
+**Nota**: Il backup DR include TUTTI i siti, indipendentemente da questa configurazione.
 
 ---
 
@@ -326,3 +344,137 @@ Questo evita che la latenza SFTP verso QNAP (~3-5 sec) blocchi il rendering dell
 - `getAllBackupsFromQnap()` - Una sola chiamata rclone per tutti i backup
 - `getSnapshots()` - Lista backup per singolo sito (usa shell_exec diretto per evitare falsi positivi)
 - `isQnapAvailable()` - Check rapido connettività QNAP
+
+---
+
+## Disaster Recovery
+
+### Contenuto backup DR
+Il backup giornaliero su Aruba contiene:
+- **Tutti i siti** (`/var/www/sites/*/public/`)
+- **Tutti i database** (dump singoli + `all-databases.sql`)
+- **Credenziali** (`.db-credentials`, `.sftp-credentials`)
+- **Config Nginx** (`/etc/nginx/sites-available/`, snippets)
+- **Pool PHP-FPM** (tutte le versioni: 7.3, 7.4, 8.1, 8.3)
+- **Certificati SSL** (`/etc/letsencrypt/`)
+- **Script PWHost** (`/usr/local/bin/pw*`, `/usr/local/bin/pwhost/`)
+- **Config rclone** per backup
+- **Cron jobs** e **sudoers**
+- **Info server** (pacchetti installati, info sistema)
+
+### Script di restore
+```bash
+pw-restore-dr --list                    # Lista backup disponibili
+pw-restore-dr --download [file]         # Solo download
+pw-restore-dr --restore-site DOMAIN     # Ripristina singolo sito
+pw-restore-dr --full [file]             # Ripristino completo server (DANGER)
+```
+
+### Procedura Disaster Recovery completa
+
+**Scenario**: Server perso, nuovo server Ubuntu 24.04 da configurare.
+
+1. **Installare pacchetti base**:
+   ```bash
+   apt update && apt install -y nginx mariadb-server redis-server rclone
+   apt install -y php7.3-fpm php7.4-fpm php8.1-fpm php8.3-fpm
+   apt install -y php8.3-mysql php8.3-curl php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip
+   ```
+
+2. **Configurare rclone per Aruba**:
+   ```bash
+   mkdir -p ~/.config/rclone
+   cat > ~/.config/rclone/rclone.conf << 'EOF'
+   [aruba-dr]
+   type = ftp
+   host = ftp2.dc1.computing.cloud.it
+   user = ARU-23558
+   pass = [PASSWORD_CRIPTATA]
+   port = 21
+   explicit_tls = true
+   EOF
+   ```
+
+3. **Scaricare e estrarre backup**:
+   ```bash
+   mkdir -p /var/backups/pwhost-dr-restore
+   rclone copy aruba-dr:/pwhost-backup/pwhost-full-backup_YYYYMMDD.tar.gz.iso /var/backups/pwhost-dr-restore/
+   cd /var/backups/pwhost-dr-restore
+   tar -xzf pwhost-full-backup_YYYYMMDD.tar.gz.iso
+   ```
+
+4. **Ripristinare configurazioni**:
+   ```bash
+   # Nginx
+   cp -a system/nginx/sites-available/* /etc/nginx/sites-available/
+   cp -a system/nginx/snippets/* /etc/nginx/snippets/
+
+   # PHP-FPM pools
+   cp system/php-fpm/7.3/*.conf /etc/php/7.3/fpm/pool.d/
+   cp system/php-fpm/7.4/*.conf /etc/php/7.4/fpm/pool.d/
+   cp system/php-fpm/8.1/*.conf /etc/php/8.1/fpm/pool.d/
+   cp system/php-fpm/8.3/*.conf /etc/php/8.3/fpm/pool.d/
+
+   # SSL certificates
+   cp -a system/letsencrypt/letsencrypt/* /etc/letsencrypt/
+
+   # Scripts
+   cp system/pwhost/pw* /usr/local/bin/
+   cp -a system/pwhost/pwhost /usr/local/bin/
+   chmod +x /usr/local/bin/pw*
+
+   # Cron e sudoers
+   cp system/cron/pwhost-backup /etc/cron.d/
+   cp system/sudoers/pwhost /etc/sudoers.d/
+   ```
+
+5. **Ripristinare siti**:
+   ```bash
+   mkdir -p /var/www/sites
+   cp -a sites/* /var/www/sites/
+   chown -R www-data:www-data /var/www/sites
+   ```
+
+6. **Ripristinare database**:
+   ```bash
+   mysql < all-databases.sql
+   ```
+
+7. **Riavviare servizi**:
+   ```bash
+   nginx -t && systemctl restart nginx
+   systemctl restart php7.3-fpm php7.4-fpm php8.1-fpm php8.3-fpm
+   systemctl restart mariadb redis-server
+   ```
+
+8. **Verificare**:
+   - Tutti i siti web
+   - Certificati SSL (potrebbero richiedere `certbot renew`)
+   - Backup funzionanti
+
+### Verifica stato DR
+```bash
+# Log backup DR
+tail -f /var/log/pwhost-backup-dr.log
+
+# Lista backup su Aruba
+rclone lsl aruba-dr:/pwhost-backup/
+
+# Test connessione Aruba
+rclone lsd aruba-dr:/
+```
+
+### Troubleshooting DR
+
+**Errore "Policy requires SSL"**:
+```bash
+# Verificare che rclone abbia explicit_tls = true
+cat ~/.config/rclone/rclone.conf
+```
+
+**Errore "550 Access is denied"**:
+- Il file deve avere estensione `.iso` per Aruba FTP
+
+**Backup troppo grande**:
+- Verificare spazio su Aruba (max ~50GB tipicamente)
+- Considerare esclusione di file temporanei/cache
