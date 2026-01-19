@@ -697,8 +697,23 @@ if (isAuthenticated() && isset($_GET['action'])) {
 
                 if ($dumpFile) {
                     $scriptContent .= "log_status \"running\" \"Importazione database...\" 75\n";
-                    $scriptContent .= "mysql " . escapeshellarg($dbName) . " < " . escapeshellarg($dumpFile) . " 2>&1\n";
-                    $scriptContent .= "rm -f " . escapeshellarg($dumpFile) . "\n\n";
+                    $scriptContent .= "DUMP_FILE=" . escapeshellarg($dumpFile) . "\n";
+                    $scriptContent .= "ACTUAL_SQL=\"\$DUMP_FILE\"\n";
+                    $scriptContent .= "TEMP_DIR=\"\"\n";
+                    $scriptContent .= "if [[ \"\$DUMP_FILE\" == *.zip ]]; then\n";
+                    $scriptContent .= "    TEMP_DIR=\$(mktemp -d)\n";
+                    $scriptContent .= "    unzip -q \"\$DUMP_FILE\" -d \"\$TEMP_DIR\"\n";
+                    $scriptContent .= "    ACTUAL_SQL=\$(find \"\$TEMP_DIR\" -name \"*.sql\" | head -1)\n";
+                    $scriptContent .= "elif [[ \"\$DUMP_FILE\" == *.gz ]]; then\n";
+                    $scriptContent .= "    TEMP_DIR=\$(mktemp -d)\n";
+                    $scriptContent .= "    ACTUAL_SQL=\"\$TEMP_DIR/dump.sql\"\n";
+                    $scriptContent .= "    gunzip -c \"\$DUMP_FILE\" > \"\$ACTUAL_SQL\"\n";
+                    $scriptContent .= "fi\n";
+                    $scriptContent .= "if [ -n \"\$ACTUAL_SQL\" ] && [ -f \"\$ACTUAL_SQL\" ]; then\n";
+                    $scriptContent .= "    mysql " . escapeshellarg($dbName) . " < \"\$ACTUAL_SQL\" 2>&1\n";
+                    $scriptContent .= "fi\n";
+                    $scriptContent .= "[ -n \"\$TEMP_DIR\" ] && rm -rf \"\$TEMP_DIR\"\n";
+                    $scriptContent .= "rm -f \"\$DUMP_FILE\"\n\n";
                 }
 
                 // Aggiorna config.php ProcessWire se presente
