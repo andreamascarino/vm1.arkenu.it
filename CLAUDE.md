@@ -29,12 +29,12 @@
 | Servizio | Versione | Note |
 |----------|----------|------|
 | Nginx | 1.24.0 | Reverse proxy + web server |
-| PHP-FPM | 7.3, 7.4, 8.1, 8.3 | Multi-versione, pool per sito |
-| MariaDB | 10.11.13 | Database MySQL-compatible |
-| Redis | - | Session storage + cache |
+| PHP-FPM | 7.3, 7.4, 8.1, 8.3 | Multi-versione, pool per sito, open_basedir attivo |
+| MariaDB | 10.11.14 | Database MySQL-compatible |
+| Redis | 7.0.15 | Session storage + cache |
 | Fail2ban | - | Protezione SSH |
 | atd | - | Job scheduler asincrono |
-| SSH | OpenSSH | Porta 22 |
+| SSH | OpenSSH | Porta 22, X11Forwarding disabilitato |
 
 ---
 
@@ -251,30 +251,73 @@ php_value[session.save_handler] = redis
 php_value[session.save_path] = "tcp://127.0.0.1:6379"
 php_value[upload_max_filesize] = 100M
 php_value[memory_limit] = 256M
+
+; Security: restrict file access to site directory only
+php_admin_value[open_basedir] = /var/www/sites/dominio.it/:/tmp/:/usr/share/php/
 ```
+
+**Nota**: `open_basedir` isola ogni sito impedendo l'accesso a file di altri siti.
 
 ---
 
 ## Sicurezza
 
+### Configurazione Generale
 - **Fail2ban**: SSH protetto (3 tentativi, ban 1 ora)
 - **IP whitelist**: 194.48.249.245 (QNAP)
 - **SFTP chroot**: Utenti SFTP confinati in /var/www/sites/{sito}
 - **HTTPS**: Let's Encrypt via Certbot
+- **TLS**: Solo TLSv1.2 e TLSv1.3 (1.0/1.1 disabilitati)
+- **SSH**: PasswordAuthentication=no, X11Forwarding=no
+
+### Isolamento Siti (open_basedir)
+Ogni sito PHP è isolato tramite `open_basedir`:
+```
+/var/www/sites/{dominio}/:/tmp/:/usr/share/php/
+```
+
+Questo impedisce a un sito compromesso di:
+- Leggere file di altri siti
+- Leggere credenziali database di altri siti
+- Accedere a file di sistema (/etc/passwd, etc.)
+
+**Eccezione**: La dashboard (vm1.arkenu.it) ha accesso esteso per gestire tutti i siti.
+
+### PHP disable_functions
+Funzioni pericolose disabilitate globalmente in `/etc/php/*/fpm/php.ini`:
+```
+exec, passthru, shell_exec, system, pcntl_exec
+```
+
+**Eccezione**: La dashboard ha `shell_exec` abilitato (necessario per rclone, systemctl, etc.)
+
+### Security Headers Nginx
+Tutti i siti includono `/etc/nginx/snippets/security-headers.conf`:
+```
+X-Frame-Options: SAMEORIGIN
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+Referrer-Policy: strict-origin-when-cross-origin
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+```
+
+### Report Sicurezza
+Ultimo audit: `SECURITY-AUDIT-2026-01-21.md` (score: 8.8/10)
 
 ---
 
 ## Siti Ospitati
 
-| Dominio | PHP | Note |
-|---------|-----|------|
-| arkenu.it | 8.3 | |
-| cato2.it | 8.3 | Backup attivo |
-| claviere.it | 7.4 | Backup attivo, webcam cron |
-| keeplive.it | 8.3 | |
-| vitaminag.arkenu.org | 7.3 | Legacy PHP |
-| vm1.arkenu.it | 8.3 | Dashboard PWHost |
-| fasiresults.keeplive.it | 8.3 | Solo file, no DB |
+| Dominio | PHP | ProcessWire | Note |
+|---------|-----|-------------|------|
+| arkenu.it | 8.3 | 3.0.255 | Ultima versione |
+| cato2.it | 8.3 | 3.0.246 | Backup QNAP attivo |
+| claviere.it | 7.4 | 3.0.123 | Backup attivo, **aggiornare PW!** |
+| keeplive.it | 8.3 | 3.0.246 | |
+| vitaminag.arkenu.org | 7.3 | 3.0.246 | **Migrare a PHP 8.x** |
+| vm1.arkenu.it | 8.3 | - | Dashboard PWHost |
+| fasiresults.keeplive.it | 8.3 | - | Sito custom, no ProcessWire |
+| app.baboom.it | 8.3 | 3.0.229 | Redirect a www.baboom.it |
 
 ---
 
@@ -318,6 +361,10 @@ rclone lsd qnap:/share/FTP/processwire/
 tail -f /var/log/pwhost-backup.log
 ```
 
+### Spazio disco non mostrato nella dashboard
+Le funzioni PHP `disk_total_space()` e `disk_free_space()` richiedono un path all'interno di `open_basedir`.
+Usare `/var/www/sites/` (non `/`) come argomento, altrimenti restituiscono `false` silenziosamente.
+
 ---
 
 ## Note Importanti
@@ -327,6 +374,7 @@ tail -f /var/log/pwhost-backup.log
 3. Gli script wrapper devono stare in `/usr/local/lib/pwhost/scripts/` (non `/tmp/` o `/run/` per noexec)
 4. ProcessWire richiede aggiornamento `config.php` dopo import (DB credentials + httpHost)
 5. I file temporanei in `/tmp/` vengono puliti ogni notte se > 1 giorno
+6. `disk_total_space()` e `disk_free_space()` devono usare un path dentro `open_basedir` (es. `/var/www/sites/`)
 
 ---
 
@@ -478,3 +526,50 @@ cat ~/.config/rclone/rclone.conf
 **Backup troppo grande**:
 - Verificare spazio su Aruba (max ~50GB tipicamente)
 - Considerare esclusione di file temporanei/cache
+
+---
+
+## Git e Deploy
+
+### Architettura
+- **Utente deploy**: `deploy` (uid 1001), membro del gruppo `www-data`
+- **Proprietà file**: `deploy:www-data` con permessi 775
+- **Repos git**: In `/var/www/sites/{dominio}/public/.git`
+- **Remote**: GitHub (andreamascarino)
+
+### Workflow
+1. Sviluppo su server di **staging**
+2. Commit e push su GitHub
+3. Pull su server di **produzione** con utente `deploy`
+
+### Compatibilità con open_basedir
+`open_basedir` NON interferisce con git perché:
+- Git viene eseguito dall'utente `deploy` (non www-data)
+- `open_basedir` limita solo le operazioni PHP
+- Il deploy continua a funzionare normalmente
+
+### Siti con repo git attivo
+- arkenu.it → github.com/andreamascarino/arkenu.it.git
+- cato2.it
+- claviere.it
+- keeplive.it
+- vitaminag.arkenu.org
+- vm1.arkenu.it → github.com/andreamascarino/vm1.arkenu.it.git
+- fasiresults.keeplive.it
+
+---
+
+## Changelog Sicurezza (2026-01-21)
+
+| Ora | Modifica |
+|-----|----------|
+| 09:00 | Disabilitato TLS 1.0/1.1 in `/etc/nginx/nginx.conf` |
+| 09:00 | Disabilitato X11Forwarding in `/etc/ssh/sshd_config` |
+| 09:05 | Aggiunto `disable_functions` a tutti i php.ini (exec, passthru, shell_exec, system) |
+| 09:10 | Aggiornati ~100 pacchetti sistema (MariaDB 10.11.14, PHP, systemd) |
+| 09:25 | Fix rclone config www-data: aggiunto `explicit_tls=true` per aruba-dr |
+| 09:26 | Fix script check-updates.sh per conteggio corretto pacchetti |
+| 10:15 | Implementato `open_basedir` per tutti i pool PHP-FPM |
+| 10:20 | Aggiornato `/usr/local/bin/pw-create` con open_basedir automatico |
+
+**Score sicurezza**: da 7/10 a **8.8/10**
