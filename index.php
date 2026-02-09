@@ -394,9 +394,9 @@ if (isAuthenticated() && isset($_GET['action'])) {
         case 'disk':
             // Solo spazio server locale (veloce) - QNAP viene caricato separatamente
             $server = [
-                'total' => disk_total_space('/'),
-                'free' => disk_free_space('/'),
-                'used' => disk_total_space('/') - disk_free_space('/')
+                'total' => disk_total_space('/var/www/sites/'),
+                'free' => disk_free_space('/var/www/sites/'),
+                'used' => disk_total_space('/var/www/sites/') - disk_free_space('/var/www/sites/')
             ];
             echo json_encode(['server' => $server, 'qnap' => null]);
             exit;
