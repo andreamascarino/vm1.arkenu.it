@@ -226,6 +226,31 @@ function getSitePhpVersion($domain) {
     return '8.3';
 }
 
+function getRedirects() {
+    $file = '/etc/pwhost-redirects.conf';
+    if (!file_exists($file)) return [];
+    $redirects = [];
+    $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        $parts = preg_split('/\s+/', trim($line), 2);
+        if (count($parts) === 2) {
+            $redirects[] = ['source' => $parts[0], 'target' => $parts[1]];
+        }
+    }
+    return $redirects;
+}
+
+function getRedirectsForSite($domain, $allRedirects = null) {
+    if ($allRedirects === null) $allRedirects = getRedirects();
+    $result = [];
+    foreach ($allRedirects as $r) {
+        if ($r['target'] === $domain) {
+            $result[] = $r['source'];
+        }
+    }
+    return $result;
+}
+
 function getSiteDetails($domain, $siteDir) {
     $sizeFiles = trim(shell_exec("du -sh " . escapeshellarg($siteDir) . " 2>/dev/null | cut -f1"));
     $dbCreds = getDbCredentials($siteDir);
@@ -276,6 +301,8 @@ if (isAuthenticated() && isset($_GET['action'])) {
             $backupEnabled = getBackupEnabled();
             $phpVersions = getAvailablePhpVersions();
 
+            $allRedirects = getRedirects();
+
             foreach (glob(SITES_DIR . '/*/') as $dir) {
                 $domain = basename($dir);
                 if ($domain === 'vm1.arkenu.it') continue;
@@ -307,7 +334,8 @@ if (isAuthenticated() && isset($_GET['action'])) {
                     'sftpPass' => $details['sftpPass'],
                     'docRoot' => "/var/www/sites/$domain/public",
                     'backupEnabled' => $backupOn,
-                    'aliases' => $details['aliases']
+                    'aliases' => $details['aliases'],
+                    'redirects' => getRedirectsForSite($domain, $allRedirects)
                 ];
             }
             // Ordinamento: prima per dominio base (alfabetico), poi principale prima dei sottodomini
@@ -600,29 +628,13 @@ if (isAuthenticated() && isset($_GET['action'])) {
             ]));
             chmod($statusFile, 0666);
 
-            // Se c'è un backup QNAP da importare, usa il workflow asincrono
-            if ($qnapBackupPath && preg_match('#^/processwire/[a-z0-9.-]+/current/[a-z0-9._-]+\.tar\.gz$#i', $qnapBackupPath)) {
-                // Creazione asincrona con import backup
-                $bgCmd = "sudo /usr/local/bin/pw-create-async " .
-                    escapeshellarg($statusFile) . " " .
-                    escapeshellarg($domain) . " " .
-                    escapeshellarg($phpVersion) . " " .
-                    escapeshellarg($sftp) . " " .
-                    escapeshellarg($qnapBackupPath);
-
-                shell_exec("echo " . escapeshellarg($bgCmd) . " | at now 2>/dev/null");
-
-                echo json_encode([
-                    'success' => true,
-                    'async' => true,
-                    'jobId' => $jobId,
-                    'message' => 'Creazione sito con import backup avviata'
-                ]);
-                exit;
+            // Valida path QNAP se presente
+            if ($qnapBackupPath && !preg_match('#^/processwire/[a-z0-9.-]+/current/[a-z0-9._-]+\.tar\.gz$#i', $qnapBackupPath)) {
+                $qnapBackupPath = ''; // path non valido, ignora
             }
 
-            // Altrimenti usa il workflow asincrono semplice (senza import QNAP ma sempre asincrono)
-            // per evitare problemi con PHP-FPM restart
+            // Workflow asincrono unificato: tutto passa da pw-create-async
+            // pw-create-async gestisce: sito semplice, ZIP, DB, ZIP+DB, backup QNAP
 
             // Se ci sono file da uploadare, gestiscili prima
             $dumpFile = '';
@@ -641,146 +653,69 @@ if (isAuthenticated() && isset($_GET['action'])) {
                 chmod($siteZip, 0644);
             }
 
-            // Costruisci comando per pw-create-async
-            // pw-create supporta già il dump SQL come parametro
+            // Comando unificato per pw-create-async
+            // Firma: pw-create-async STATUS DOMAIN PHP SFTP BACKUP_PATH PROD_DOMAIN SITE_ZIP SQL_DUMP
             $bgCmd = "sudo /usr/local/bin/pw-create-async " .
                 escapeshellarg($statusFile) . " " .
                 escapeshellarg($domain) . " " .
                 escapeshellarg($phpVersion) . " " .
-                escapeshellarg($sftp);
+                escapeshellarg($sftp) . " " .
+                escapeshellarg($qnapBackupPath ?: '') . " " .
+                escapeshellarg('') . " " .          // prod_domain (non usato qui)
+                escapeshellarg($siteZip) . " " .
+                escapeshellarg($dumpFile);
 
-            // Se c'è solo dump SQL (senza ZIP), passalo a pw-create tramite pw-create-async
-            // pw-create accetta il dump come ultimo parametro
-            if ($dumpFile && !$siteZip) {
-                // Il dump viene passato direttamente a pw-create che lo gestisce internamente
-                $bgCmd .= " " . escapeshellarg($dumpFile);
-                shell_exec("echo " . escapeshellarg($bgCmd) . " | at now 2>/dev/null");
-
-                echo json_encode([
-                    'success' => true,
-                    'async' => true,
-                    'jobId' => $jobId,
-                    'message' => 'Creazione sito con import database avviata'
-                ]);
-                exit;
-            }
-
-            // Se c'è ZIP (con o senza dump), usiamo uno script wrapper
-            if ($siteZip) {
-                // Crea uno script temporaneo che gestisce tutto il flusso
-                $wrapperScript = '/usr/local/lib/pwhost/scripts/' . $jobId . '.sh';
-                $dbName = preg_replace('/[.-]/', '_', substr($domain, 0, 16));
-
-                $scriptContent = "#!/bin/bash\n";
-                $scriptContent .= "STATUS_FILE=" . escapeshellarg($statusFile) . "\n";
-                $scriptContent .= "DOMAIN=" . escapeshellarg($domain) . "\n";
-                $scriptContent .= "SITE_DIR=\"/var/www/sites/\$DOMAIN\"\n\n";
-
-                $scriptContent .= "log_status() {\n";
-                $scriptContent .= "    echo \"{\\\"status\\\":\\\"\$1\\\",\\\"message\\\":\\\"\$2\\\",\\\"percent\\\":\$3,\\\"timestamp\\\":\$(date +%s)}\" > \"\$STATUS_FILE\"\n";
-                $scriptContent .= "    chmod 666 \"\$STATUS_FILE\" 2>/dev/null\n";
-                $scriptContent .= "}\n\n";
-
-                $scriptContent .= "log_status \"running\" \"Creazione sito base...\" 10\n";
-                $scriptContent .= "/usr/local/bin/pw-create " . escapeshellarg($domain) . " " . escapeshellarg($phpVersion);
-                if ($sftp) $scriptContent .= " sftp";
-                $scriptContent .= " 2>&1\n";
-                $scriptContent .= "if [ \$? -ne 0 ]; then\n";
-                $scriptContent .= "    log_status \"error\" \"Errore creazione sito base\" 0\n";
-                $scriptContent .= "    exit 1\n";
-                $scriptContent .= "fi\n\n";
-
-                $scriptContent .= "log_status \"running\" \"Estrazione file ZIP...\" 50\n";
-                $scriptContent .= "cd \"\$SITE_DIR/public\" && unzip -o " . escapeshellarg($siteZip) . " 2>&1\n";
-                $scriptContent .= "chown -R www-data:www-data \"\$SITE_DIR/public\"\n";
-                $scriptContent .= "rm -f " . escapeshellarg($siteZip) . "\n\n";
-
-                if ($dumpFile) {
-                    $scriptContent .= "log_status \"running\" \"Importazione database...\" 75\n";
-                    $scriptContent .= "DUMP_FILE=" . escapeshellarg($dumpFile) . "\n";
-                    $scriptContent .= "ACTUAL_SQL=\"\$DUMP_FILE\"\n";
-                    $scriptContent .= "TEMP_DIR=\"\"\n";
-                    $scriptContent .= "if [[ \"\$DUMP_FILE\" == *.zip ]]; then\n";
-                    $scriptContent .= "    TEMP_DIR=\$(mktemp -d)\n";
-                    $scriptContent .= "    unzip -q \"\$DUMP_FILE\" -d \"\$TEMP_DIR\"\n";
-                    $scriptContent .= "    ACTUAL_SQL=\$(find \"\$TEMP_DIR\" -name \"*.sql\" | head -1)\n";
-                    $scriptContent .= "elif [[ \"\$DUMP_FILE\" == *.gz ]]; then\n";
-                    $scriptContent .= "    TEMP_DIR=\$(mktemp -d)\n";
-                    $scriptContent .= "    ACTUAL_SQL=\"\$TEMP_DIR/dump.sql\"\n";
-                    $scriptContent .= "    gunzip -c \"\$DUMP_FILE\" > \"\$ACTUAL_SQL\"\n";
-                    $scriptContent .= "fi\n";
-                    $scriptContent .= "if [ -n \"\$ACTUAL_SQL\" ] && [ -f \"\$ACTUAL_SQL\" ]; then\n";
-                    $scriptContent .= "    mysql " . escapeshellarg($dbName) . " < \"\$ACTUAL_SQL\" 2>&1\n";
-                    $scriptContent .= "fi\n";
-                    $scriptContent .= "[ -n \"\$TEMP_DIR\" ] && rm -rf \"\$TEMP_DIR\"\n";
-                    $scriptContent .= "rm -f \"\$DUMP_FILE\"\n\n";
-                }
-
-                // Aggiorna config.php ProcessWire se presente
-                $scriptContent .= "# Aggiorna config.php con nuove credenziali se esiste\n";
-                $scriptContent .= "if [ -f \"\$SITE_DIR/public/site/config.php\" ] && [ -f \"\$SITE_DIR/.db-credentials\" ]; then\n";
-                $scriptContent .= "    log_status \"running\" \"Aggiornamento configurazione...\" 90\n";
-                $scriptContent .= "    DB_NAME=\$(grep 'Database:' \"\$SITE_DIR/.db-credentials\" | awk '{print \$2}')\n";
-                $scriptContent .= "    DB_USER=\$(grep 'User:' \"\$SITE_DIR/.db-credentials\" | awk '{print \$2}')\n";
-                $scriptContent .= "    DB_PASS=\$(grep 'Pass:' \"\$SITE_DIR/.db-credentials\" | awk '{print \$2}')\n";
-                $scriptContent .= "    sudo /usr/local/bin/pw-update-config \"\$SITE_DIR/public/site/config.php\" \"\$DB_NAME\" \"\$DB_USER\" \"\$DB_PASS\" \"\$DOMAIN\" 2>/dev/null\n";
-                $scriptContent .= "fi\n\n";
-
-                $scriptContent .= "log_status \"completed\" \"Sito creato con file importati!\" 100\n";
-                $scriptContent .= "rm -f " . escapeshellarg($wrapperScript) . "\n";
-
-                file_put_contents($wrapperScript, $scriptContent);
-                chmod($wrapperScript, 0755);
-
-                shell_exec("echo " . escapeshellarg("sudo " . $wrapperScript) . " | at now 2>/dev/null");
-
-                echo json_encode([
-                    'success' => true,
-                    'async' => true,
-                    'jobId' => $jobId,
-                    'message' => 'Creazione sito con import file avviata'
-                ]);
-                exit;
-            }
-
-            // Creazione semplice senza file
             shell_exec("echo " . escapeshellarg($bgCmd) . " | at now 2>/dev/null");
+
+            $msg = 'Creazione sito avviata';
+            if ($siteZip && $dumpFile) $msg = 'Creazione sito con file e database avviata';
+            elseif ($siteZip) $msg = 'Creazione sito con import file avviata';
+            elseif ($dumpFile) $msg = 'Creazione sito con import database avviata';
 
             echo json_encode([
                 'success' => true,
                 'async' => true,
                 'jobId' => $jobId,
-                'message' => 'Creazione sito avviata'
+                'message' => $msg
             ]);
             exit;
 
         case 'create-status':
-            // Polling stato creazione sito asincrona
             $jobId = $_GET['job'] ?? '';
             $jobId = preg_replace('/[^a-z0-9_]/i', '', $jobId);
             $statusFile = '/var/run/pwhost/' . $jobId . '.json';
-
             if (!$jobId || !file_exists($statusFile)) {
                 echo json_encode(['status' => 'unknown', 'message' => 'Job non trovato']);
                 exit;
             }
-
             $content = file_get_contents($statusFile);
             $status = json_decode($content, true);
-
             if (!$status) {
                 echo json_encode(['status' => 'error', 'message' => 'Errore lettura stato']);
                 exit;
             }
-
-            // Se completato o errore, elimina il file di stato dopo un po'
-            if (in_array($status['status'], ['completed', 'error'])) {
-                // Mantieni il file per 60 secondi per permettere al client di leggerlo
-                if (isset($status['timestamp']) && (time() - $status['timestamp']) > 60) {
-                    unlink($statusFile);
+            // Timeout: se running da più di 15 minuti, segna come errore
+            if ($status['status'] === 'running' && isset($status['timestamp'])) {
+                if (time() - $status['timestamp'] > 900) {
+                    $logFile = '/var/run/pwhost/' . $jobId . '.log';
+                    $logTail = '';
+                    if (file_exists($logFile)) {
+                        $lines = file($logFile);
+                        $logTail = implode(' ', array_slice($lines, -5));
+                        $logTail = substr(trim($logTail), 0, 200);
+                    }
+                    $errorMsg = 'Timeout: il job non risponde da oltre 15 minuti';
+                    if ($logTail) $errorMsg .= ' — ' . $logTail;
+                    $status = ['status' => 'error', 'message' => $errorMsg, 'percent' => 0, 'timestamp' => time()];
+                    file_put_contents($statusFile, json_encode($status));
                 }
             }
-
+            // Pulizia: elimina file di stato dopo 60s dal completamento/errore
+            if (in_array($status['status'], ['completed', 'error'])) {
+                if (isset($status['timestamp']) && (time() - $status['timestamp']) > 60) {
+                    @unlink($statusFile);
+                }
+            }
             echo json_encode($status);
             exit;
 
@@ -809,7 +744,7 @@ if (isAuthenticated() && isset($_GET['action'])) {
             $domain = $_GET["domain"] ?? "";
             $alias = $_GET["alias"] ?? "";
             if ($domain && $alias && preg_match("/^[a-z0-9.-]+$/i", $domain) && preg_match("/^[a-z0-9.-]+$/i", $alias)) {
-                $output = shell_exec("sudo /usr/local/bin/pw-alias add " . escapeshellarg($domain) . " " . escapeshellarg($alias) . " 2>\&1");
+                $output = shell_exec("sudo /usr/local/bin/pw-alias add " . escapeshellarg($domain) . " " . escapeshellarg($alias) . " 2>&1");
                 echo json_encode(["success" => true, "output" => $output]);
             } else {
                 echo json_encode(["success" => false, "error" => "Parametri non validi"]);
@@ -820,7 +755,28 @@ if (isAuthenticated() && isset($_GET['action'])) {
             $domain = $_GET["domain"] ?? "";
             $alias = $_GET["alias"] ?? "";
             if ($domain && $alias && preg_match("/^[a-z0-9.-]+$/i", $domain) && preg_match("/^[a-z0-9.-]+$/i", $alias)) {
-                $output = shell_exec("sudo /usr/local/bin/pw-alias remove " . escapeshellarg($domain) . " " . escapeshellarg($alias) . " 2>\&1");
+                $output = shell_exec("sudo /usr/local/bin/pw-alias remove " . escapeshellarg($domain) . " " . escapeshellarg($alias) . " 2>&1");
+                echo json_encode(["success" => true, "output" => $output]);
+            } else {
+                echo json_encode(["success" => false, "error" => "Parametri non validi"]);
+            }
+            exit;
+
+        case "redirect-add":
+            $domain = $_GET["domain"] ?? "";
+            $source = $_GET["source"] ?? "";
+            if ($domain && $source && preg_match("/^[a-z0-9.-]+$/i", $domain) && preg_match("/^[a-z0-9.-]+$/i", $source)) {
+                $output = shell_exec("sudo /usr/local/bin/pw-redirect add " . escapeshellarg($source) . " " . escapeshellarg($domain) . " 2>&1");
+                echo json_encode(["success" => true, "output" => $output]);
+            } else {
+                echo json_encode(["success" => false, "error" => "Parametri non validi"]);
+            }
+            exit;
+
+        case "redirect-remove":
+            $source = $_GET["source"] ?? "";
+            if ($source && preg_match("/^[a-z0-9.-]+$/i", $source)) {
+                $output = shell_exec("sudo /usr/local/bin/pw-redirect remove " . escapeshellarg($source) . " 2>&1");
                 echo json_encode(["success" => true, "output" => $output]);
             } else {
                 echo json_encode(["success" => false, "error" => "Parametri non validi"]);
@@ -1091,6 +1047,23 @@ if (!isAuthenticated()):
         </div>
     </div>
     <div class="modal" id="modal-output"><div class="modal-content"><div class="modal-header"><h2 id="output-title">Output</h2><button class="modal-close" onclick="closeModal('output')">✕</button></div><div id="output-content" class="output"></div><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal('output')">Chiudi</button></div></div></div>
+    <div class="modal" id="domain-modal">
+        <div class="modal-content">
+            <div class="modal-header"><h2 id="domain-modal-title">Aggiungi Alias</h2><button class="modal-close" onclick="closeDomainModal()">✕</button></div>
+            <div class="form-group">
+                <label>Dominio</label>
+                <input type="text" id="domain-modal-input" placeholder="dominio.it">
+            </div>
+            <div id="domain-modal-progress" class="progress-container" style="display:none">
+                <div class="progress-bar"><div class="progress-fill"></div></div>
+            </div>
+            <div id="domain-modal-status" style="font-size:0.875rem;min-height:1.2em;margin-bottom:0.5rem"></div>
+            <div class="modal-actions">
+                <button class="btn btn-primary" id="domain-modal-btn">Crea Alias</button>
+                <button class="btn btn-secondary" onclick="closeDomainModal()">Annulla</button>
+            </div>
+        </div>
+    </div>
     <div id="restore-progress" style="display:none;position:fixed;bottom:80px;left:50%;transform:translateX(-50%);width:400px;z-index:1001;background:linear-gradient(135deg,#f59e0b,#d97706);padding:20px;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,0.4);">
         <div style="color:#fff;font-weight:600;font-size:0.95rem;margin-bottom:12px;" id="restore-status">Restore in corso...</div>
         <div style="background:rgba(0,0,0,0.2);border-radius:6px;height:8px;overflow:hidden;"><div class="progress-fill indeterminate" id="restore-fill" style="height:100%;background:#fff;border-radius:6px;"></div></div>

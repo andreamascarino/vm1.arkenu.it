@@ -172,8 +172,13 @@ function updateProgress(percent, status) {
 }
 
 let sitesData = {};
+let expandedDomain = null;
 
 function loadSites() {
+    // Remember which site is currently expanded
+    const cur = document.querySelector('.site-item.expanded');
+    if (cur) expandedDomain = cur.dataset.domain;
+
     fetch('?action=sites').then(r => r.json()).then(sites => {
         document.getElementById('sites-count').textContent = sites.length;
         if (sites.length === 0) {
@@ -193,19 +198,30 @@ function loadSites() {
                     <div class="panel-row"><span class="label">Password</span><span class="value clickable" onclick="copyToClipboard('${s.sftpPass}')">${s.sftpPass}</span></div>
                 </div>` : '';
 
-            const aliasSection = `
+            const allDomains = [
+                ...(s.aliases || []).map(a => ({name: a, type: 'alias'})),
+                ...(s.redirects || []).map(r => ({name: r, type: 'redirect'}))
+            ];
+            const aliasCount = (s.aliases || []).length;
+            const redirectCount = (s.redirects || []).length;
+            const domainsSection = `
                 <div class="panel-section">
-                    <h4>Domini Alias</h4>
-                    <div id="aliases-${s.domain}" class="aliases-list">
-                        ${(s.aliases || []).map(a => `<div class="alias-item"><span>${a}</span><button class="btn-tiny btn-danger" onclick="event.stopPropagation(); removeAlias('${s.domain}', '${a}')">✕</button></div>`).join('') || '<span style="color:var(--text-muted)">Nessun alias</span>'}
+                    <h4>Domini</h4>
+                    <div class="aliases-list">
+                        ${allDomains.length === 0 ? '<div style="color:var(--text-muted);font-size:0.85rem;padding:4px 0">Nessun alias o redirect</div>' : ''}
+                        ${allDomains.map(d => `<div class="alias-item">
+                            <span class="badge ${d.type === 'alias' ? 'badge-alias-sm' : 'badge-redirect-sm'}">${d.type === 'alias' ? 'A' : 'R'}</span>
+                            <span>${d.name}${d.type === 'redirect' ? ' &rarr; ' + s.domain : ''}</span>
+                            <button class="btn-tiny btn-danger" onclick="event.stopPropagation(); ${d.type === 'alias' ? `removeAlias('${s.domain}','${d.name}')` : `removeRedirect('${s.domain}','${d.name}')`}">✕</button>
+                        </div>`).join('')}
                     </div>
-                    <div class="panel-row" style="margin-top:10px">
-                        <input type="text" id="new-alias-${s.domain}" placeholder="alias.dominio.it" class="form-input-sm" onclick="event.stopPropagation()" style="flex:1">
-                        <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); addAlias('${s.domain}')">+ Aggiungi</button>
+                    <div style="display:flex;gap:8px;margin-top:10px">
+                        <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); openDomainModal('${s.domain}', 'alias')">+ Alias</button>
+                        <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); openDomainModal('${s.domain}', 'redirect')">+ Redirect</button>
                     </div>
                 </div>`;
-            
-            const phpOptions = (s.phpVersions || phpVersions).map(v => 
+
+            const phpOptions = (s.phpVersions || phpVersions).map(v =>
                 `<option value="${v}" ${v === s.phpVersion ? 'selected' : ''}>${v}</option>`
             ).join('');
             
@@ -221,6 +237,8 @@ function loadSites() {
                                     <span class="badge badge-${s.ssl ? 'ssl' : 'http'}">${s.ssl ? '🔒 SSL' : '⚠️ HTTP'}</span>
                                     <span class="badge badge-php">PHP ${s.phpVersion}</span>
                                     <span class="badge badge-backup-${s.backupEnabled ? 'on' : 'off'}">${s.backupEnabled ? '✓ Backup' : '✗ Backup'}</span>
+                                    ${aliasCount > 0 ? `<span class="badge badge-alias">${aliasCount} alias</span>` : ''}
+                                    ${redirectCount > 0 ? `<span class="badge badge-redirect">${redirectCount} redirect</span>` : ''}
                                 </div>
                             </div>
                             <div class="site-meta">
@@ -247,7 +265,7 @@ function loadSites() {
                             <div class="panel-row"><span class="label">Password</span><span class="value clickable" onclick="copyToClipboard('${s.dbPass}')">${s.dbPass || '-'}</span></div>
                         </div>
                         ${sftpSection}
-                        ${aliasSection}
+                        ${domainsSection}
                         <div class="panel-section">
                             <h4>Configurazione</h4>
                             <div class="panel-row">
@@ -281,6 +299,16 @@ function loadSites() {
         document.getElementById('sites-list').innerHTML = html;
         // Carica i dati backup in background (lazy loading per performance)
         loadBackupData();
+
+        // Re-expand previously open site
+        if (expandedDomain) {
+            const item = document.querySelector(`.site-item[data-domain="${expandedDomain}"]`);
+            if (item) {
+                item.classList.add("expanded");
+                loadSnapshots(expandedDomain);
+                loadBackupSize(expandedDomain);
+            }
+        }
     });
 }
 
@@ -786,29 +814,77 @@ function drawMiniChart(containerId, data, color, fixedMax = null) {
 }
 
 
-function addAlias(domain) {
-    const input = document.getElementById('new-alias-' + domain);
-    const alias = input.value.trim().toLowerCase();
-    if (!alias) {
-        showToast('Inserisci un alias', 'error');
-        return;
-    }
-    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(alias)) {
-        showToast('Formato alias non valido', 'error');
-        return;
-    }
-    showToast('Aggiunta alias...');
-    fetch('?action=alias-add&domain=' + encodeURIComponent(domain) + '&alias=' + encodeURIComponent(alias))
-        .then(r => r.json())
-        .then(d => {
-            if (d.success) {
-                showToast('Alias aggiunto!');
-                input.value = '';
-                loadSites();
-            } else {
-                showToast('Errore: ' + (d.error || 'sconosciuto'), 'error');
-            }
-        });
+function openDomainModal(domain, type) {
+    const modal = document.getElementById('domain-modal');
+    const title = document.getElementById('domain-modal-title');
+    const input = document.getElementById('domain-modal-input');
+    const btn = document.getElementById('domain-modal-btn');
+    const status = document.getElementById('domain-modal-status');
+    const progress = document.getElementById('domain-modal-progress');
+
+    title.textContent = type === 'alias' ? 'Aggiungi Alias' : 'Aggiungi Redirect';
+    input.placeholder = type === 'alias' ? 'alias.dominio.it' : 'vecchiodominio.it';
+    input.value = '';
+    btn.textContent = type === 'alias' ? 'Crea Alias' : 'Crea Redirect';
+    btn.disabled = false;
+    status.textContent = '';
+    progress.style.display = 'none';
+
+    btn.onclick = function() { submitDomainModal(domain, type); };
+    input.onkeydown = function(e) { if (e.key === 'Enter') submitDomainModal(domain, type); };
+
+    modal.classList.add('active');
+    setTimeout(() => input.focus(), 100);
+}
+
+function closeDomainModal() {
+    document.getElementById('domain-modal').classList.remove('active');
+}
+
+function submitDomainModal(domain, type) {
+    const input = document.getElementById('domain-modal-input');
+    const btn = document.getElementById('domain-modal-btn');
+    const status = document.getElementById('domain-modal-status');
+    const progress = document.getElementById('domain-modal-progress');
+    const progressFill = progress.querySelector('.progress-fill');
+
+    const value = input.value.trim().toLowerCase();
+    if (!value) { status.textContent = 'Inserisci un dominio'; status.style.color = '#fca5a5'; return; }
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(value)) { status.textContent = 'Formato dominio non valido'; status.style.color = '#fca5a5'; return; }
+
+    btn.disabled = true;
+    input.disabled = true;
+    status.textContent = type === 'alias' ? 'Aggiunta alias in corso...' : 'Aggiunta redirect in corso...';
+    status.style.color = 'var(--text-muted)';
+    progress.style.display = 'block';
+    progressFill.classList.add('indeterminate');
+
+    const url = type === 'alias'
+        ? '?action=alias-add&domain=' + encodeURIComponent(domain) + '&alias=' + encodeURIComponent(value)
+        : '?action=redirect-add&domain=' + encodeURIComponent(domain) + '&source=' + encodeURIComponent(value);
+
+    fetch(url).then(r => r.json()).then(d => {
+        progressFill.classList.remove('indeterminate');
+        if (d.success) {
+            progressFill.style.width = '100%';
+            status.textContent = type === 'alias' ? 'Alias aggiunto!' : 'Redirect aggiunto!';
+            status.style.color = '#4ade80';
+            setTimeout(() => { closeDomainModal(); loadSites(); }, 800);
+        } else {
+            progress.style.display = 'none';
+            status.textContent = 'Errore: ' + (d.error || d.output || 'sconosciuto');
+            status.style.color = '#fca5a5';
+            btn.disabled = false;
+            input.disabled = false;
+        }
+    }).catch(() => {
+        progressFill.classList.remove('indeterminate');
+        progress.style.display = 'none';
+        status.textContent = 'Errore di connessione';
+        status.style.color = '#fca5a5';
+        btn.disabled = false;
+        input.disabled = false;
+    });
 }
 
 function removeAlias(domain, alias) {
@@ -819,6 +895,21 @@ function removeAlias(domain, alias) {
         .then(d => {
             if (d.success) {
                 showToast('Alias rimosso!');
+                loadSites();
+            } else {
+                showToast('Errore: ' + (d.error || 'sconosciuto'), 'error');
+            }
+        });
+}
+
+function removeRedirect(domain, source) {
+    if (!confirm('Rimuovere redirect ' + source + ' -> ' + domain + '?')) return;
+    showToast('Rimozione redirect...');
+    fetch('?action=redirect-remove&source=' + encodeURIComponent(source))
+        .then(r => r.json())
+        .then(d => {
+            if (d.success) {
+                showToast('Redirect rimosso!');
                 loadSites();
             } else {
                 showToast('Errore: ' + (d.error || 'sconosciuto'), 'error');
